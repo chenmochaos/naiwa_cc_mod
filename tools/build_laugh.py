@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""生成大笑动画的帧数据与配音。
+
+    python3 tools/build_laugh.py [--preview]
+
+输入：naiwa-videos/glimpse.mp4
+输出：plugin/data/laugh.bin        103 帧 × 44×52 像素，每像素 1 字节调色板索引，255 = 透明
+      plugin/assets/laugh.mp3      与动画取同一时间窗的配音
+      plugin/hooks/laugh-meta.ts   帧数/尺寸/帧率，供 register.tsx 读（避免两处硬编码）
+
+构图：镜头锁头不锁身体。逐帧算主体 bbox → 头部窗口 = 主体高 62%，水平锚点 =
+「主体中心 + 眼/嘴暗部质心」各一半 → 再做 9 帧滑动平均，镜头平移而不是跳。
+不做「笑到倒地」那一段（第 396 帧之后）：横躺构图在 44×26 里必然糊。
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageEnhance, ImageFilter
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from palette import PALETTE, background_mask, is_white, preview  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+VIDEO = ROOT / "naiwa-videos" / "glimpse.mp4"
+BIN_OUT = ROOT / "plugin" / "data" / "laugh.bin"
+MP3_OUT = ROOT / "plugin" / "assets" / "laugh.mp3"
+META_OUT = ROOT / "plugin" / "hooks" / "laugh-meta.ts"
+
+DEC_W, DEC_H = 204, 360          # 解码尺寸（源的一半）：够用且快
+COLS, ROWS = 44, 26
+PX_W, PX_H = COLS, ROWS * 2      # 44 x 52
+ASPECT = PX_W / PX_H
+F0, F1, STEP = 48, 356, 3        # 直立大笑弧段，倒地之前
+FPS = 10
+
+SS, DUR = 1.60, 10.27            # 音频窗口，和 F0..F1 对齐（48/30=1.6s, 103/10=10.3s）
+PAL = np.array(PALETTE, np.int16)
+ALPHA_CUT = 110
+
+
+def decode() -> np.ndarray:
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(VIDEO),
+         "-vf", f"scale={DEC_W}:{DEC_H}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    n = len(raw) // (DEC_W * DEC_H * 3)
+    return np.frombuffer(raw, np.uint8)[: n * DEC_W * DEC_H * 3].reshape(n, DEC_H, DEC_W, 3)
+
+
+def framing(a: np.ndarray) -> tuple[int, int, int, int]:
+    """单帧 → 头部窗口 (x, y, w, h)。"""
+    m = a.astype(np.int16).sum(2) < 705          # 暗于背景 = 主体
+    ys, xs = np.where(m)
+    y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+    bh = y1 - y0 + 1
+
+    wh = bh * 0.62
+    ww = wh * ASPECT
+    if ww > DEC_W:
+        ww = DEC_W
+        wh = ww / ASPECT
+
+    # 水平锚点：头带里暗部（眼/嘴）的质心，混一半主体中心，避免镜头被单只眼睛拽跑
+    band = a[y0:y0 + int(bh * 0.34)]
+    dm = band.astype(np.int16).sum(2) < 330
+    # band 横跨整宽，所以 np.where(dm)[1] 已经是绝对列号
+    cx = (0.5 * (x0 + x1) / 2 + 0.5 * np.where(dm)[1].mean()) if dm.sum() > 30 else (x0 + x1) / 2
+
+    x = int(np.clip(cx - ww / 2, 0, DEC_W - ww))
+    y = int(np.clip(y0 - bh * 0.02, 0, DEC_H - wh))
+    return x, y, int(ww), int(wh)
+
+
+def cut(a: np.ndarray) -> np.ndarray:
+    """裁块 → RGBA。背景 = 洪水填充 + 纯白规则（清掉身体围成的封闭白块）。"""
+    bg = background_mask(a) | is_white(a)
+    al = np.where(bg, 0, 255).astype(np.uint8)
+    solid = al > 0
+    er = solid & np.roll(solid, 1, 0) & np.roll(solid, -1, 0) & np.roll(solid, 1, 1) & np.roll(solid, -1, 1)
+    return np.dstack([a, np.where(er, 255, 0).astype(np.uint8)])
+
+
+def render(a: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    x, y, w, h = box
+    im = Image.fromarray(cut(a[y:y + h, x:x + w]), "RGBA").resize((PX_W, PX_H), Image.LANCZOS)
+    im = im.filter(ImageFilter.UnsharpMask(radius=3, percent=115, threshold=2))
+    return np.asarray(ImageEnhance.Color(im).enhance(1.30))
+
+
+def smooth(b: np.ndarray) -> np.ndarray:
+    k, pad = np.ones(9) / 9, 4
+    return np.stack([np.convolve(np.pad(b[:, i], pad, mode="edge"), k, mode="valid")[: len(b)]
+                     for i in range(4)], axis=1)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--preview", action="store_true", help="多写 GIF/序列图到 _design-preview/，人眼核对用")
+    args = ap.parse_args()
+
+    v = decode()
+    print(f"解码 {len(v)} 帧 {DEC_W}x{DEC_H}", file=sys.stderr)
+    idxs = list(range(F0, F1, STEP))
+
+    boxes = np.array([framing(v[i]) for i in idxs], float)
+    sb = smooth(boxes)
+
+    out = []
+    for j, i in enumerate(idxs):
+        x, y, w, h = (int(sb[j, 0]), int(sb[j, 1]), int(sb[j, 2]), int(sb[j, 3]))
+        x = max(0, min(x, DEC_W - w))
+        y = max(0, min(y, DEC_H - h))
+        out.append(render(v[i], (x, y, w, h)))
+    g = np.stack(out)                                  # (N, PX_H, PX_W, 4)
+    n = len(g)
+
+    rgb, al = g[..., :3].astype(np.int16), g[..., 3]
+    d = ((rgb[:, :, :, None, :].astype(np.int32) - PAL[None, None, None, :, :].astype(np.int32)) ** 2).sum(-1)
+    idx = np.where(al < ALPHA_CUT, 255, d.argmin(-1)).astype(np.uint8)
+
+    BIN_OUT.parent.mkdir(parents=True, exist_ok=True)
+    BIN_OUT.write_bytes(idx.tobytes())
+    digest = hashlib.sha256(idx.tobytes()).hexdigest()
+    print(f"wrote {BIN_OUT.relative_to(ROOT)}  {idx.size} B ({n} 帧 x {COLS}x{PX_H})  "
+          f"gz {len(gzip.compress(idx.tobytes(), 9))} B  sha256 {digest[:16]}", file=sys.stderr)
+
+    META_OUT.parent.mkdir(parents=True, exist_ok=True)
+    pal_ts = ", ".join(f"0x{r:02X}{g:02X}{b:02X}" for r, g, b in PALETTE)
+    META_OUT.write_text(
+        "// GENERATED by tools/build_laugh.py — 不要手改。\n"
+        "// 尺寸/帧数/色板只有这一处真源（tools/palette.py），别在 TS 侧再抄一份。\n"
+        "export const LAUGH = {\n"
+        f"  columns: {COLS},\n"
+        f"  rows: {ROWS},\n"
+        f"  frames: {n},\n"
+        f"  fps: {FPS},\n"
+        f"  bytes: {idx.size},\n"
+        "} as const\n"
+        "\n"
+        "/** laugh.bin 里每个字节是一个下标；255 = 透明，其余查这张表。 */\n"
+        f"export const LAUGH_PALETTE: readonly number[] = [{pal_ts}]\n"
+        f"export const LAUGH_TRANSPARENT = 255\n",
+        encoding="utf-8",
+    )
+    print(f"wrote {META_OUT.relative_to(ROOT)}", file=sys.stderr)
+
+    MP3_OUT.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-ss", str(SS), "-t", str(DUR), "-i", str(VIDEO),
+         "-vn", "-c:a", "libmp3lame", "-q:a", "4", str(MP3_OUT)],
+        check=True,
+    )
+    print(f"wrote {MP3_OUT.relative_to(ROOT)}  {MP3_OUT.stat().st_size} B  (ss={SS} t={DUR})", file=sys.stderr)
+
+    if args.preview:
+        prev = ROOT / "_design-preview"
+        prev.mkdir(exist_ok=True)
+        gi = [Image.fromarray(f).convert("RGB").resize((PX_W * 4, PX_H * 4), Image.NEAREST) for f in g]
+        gi[0].save(prev / "20-大笑动画-头部跟随.gif", save_all=True, append_images=gi[1:],
+                   duration=int(1000 / FPS), loop=0, optimize=True)
+        c, s = 8, 3
+        rows_n = (n + c - 1) // c
+        sheet = Image.new("RGB", (c * PX_W * s, rows_n * PX_H * s), (12, 12, 16))
+        for j, f in enumerate(g):
+            r, cc = divmod(j, c)
+            sheet.paste(Image.fromarray(f).convert("RGB").resize((PX_W * s, PX_H * s), Image.NEAREST),
+                        (cc * PX_W * s, r * PX_H * s))
+        sheet.save(prev / "21-大笑序列-头部跟随.png")
+        print("预览 → _design-preview/20-大笑动画-头部跟随.gif 21-大笑序列-头部跟随.png", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

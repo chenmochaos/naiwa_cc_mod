@@ -1,0 +1,10 @@
+# 开发期预览产物。CLAUDE.md 定它临时目录，交付后删。
+# README 要用的演示 GIF 已经拷到 docs/demo.gif，不依赖这里。
+_design-preview/
+
+# Python
+__pycache__/
+*.pyc
+
+# 误创建的空文件，不是项目内容
+/init

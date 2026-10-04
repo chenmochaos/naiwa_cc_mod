@@ -1,0 +1,23 @@
+{
+  "name": "naiwa",
+  "displayName": "奶蛙陪你写代码",
+  "version": "0.1.0",
+  "description": "奶蛙在终端里陪你写代码：像素头像、齁齁齁的台词、危险命令拦截，外加一个下班大笑彩蛋。",
+  "author": {
+    "name": "Minus"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "audio": {
+      "type": "string",
+      "title": "大笑音效",
+      "description": "clip = 放视频里的原声片段（推荐）；tts = 用系统语音合成念笑声，时长不可控、和动画对不齐；off = 静音。Linux 上 clip 走 paplay / ffplay，tts 走 spd-say。",
+      "default": "clip",
+      "options": [
+        "clip",
+        "tts",
+        "off"
+      ]
+    }
+  }
+}
