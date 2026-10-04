@@ -12,7 +12,7 @@ Claude Code ≥ 2.1.287 的原生插件（不是第三方框架）。它在终�
 | 目录 | 放什么 | 规则 |
 | --- | --- | --- |
 | `plugin/` | **插件本体，唯一的交付物** | 这里的内容必须自洽：能被 `claude plugin validate` 通过、能软链进 dev-mods 直接跑。不放任何开发期脚本 |
-| `plugin/hooks/` | `register.tsx` 逻辑 + `art.ts` / `lines.ts` / `audio.ts` 数据与辅助 | 逻辑集中在一个 `register.tsx`，其余是纯数据或纯函数，不反向依赖 register |
+| `plugin/hooks/` | `register.tsx` 编排 + `signals.ts`（场合判定/安全正则/冷却）、`gen.ts`（LLM 请求与净化）、`lines.ts`（模板与理由）、`audio.ts`、`art.ts` | 逻辑集中在一个 `register.tsx`，其余是纯数据或纯函数，不反向依赖 register；**碰 `$` 的代码只能写在 register.tsx** |
 | `plugin/data/` `plugin/assets/` | 二进制素材（帧数据、音频） | **只能由 `tools/` 生成，禁止手改** |
 | `tools/` | 从原始素材生成 `plugin/` 内容的 Python 流水线 | 每个脚本独立可跑、输出确定；跑完打 SHA-256 打印出来 |
 | `naiwa.md` `naiwa-images/` `naiwa-videos/` | Minus 提供的原始素材 | **只读，永不修改** |
@@ -45,7 +45,7 @@ python3 tools/build_laugh.py    # naiwa-videos/glimpse.mp4 -> plugin/data/laugh.
 
 ## 测试环境（和真机不一样，写测试前先读这段）
 
-`claude plugin test` 跑在一个「插件下面什么都没有」的引擎里，有两条反直觉的规则：
+`claude plugin test` 跑在一个「插件下面什么都没有」的引擎里，有几条反直觉的规则：
 
 - **测试体里的 `$` 只有驱动用的名词**：`tool` `command` `prompt` `session` `turn` `ui` `classic` 等，
   **没有** `fs` / `process` / `clock` / `store` / `state`。所以不能在测试体里直接 `$.fs.exists(...)`，
@@ -53,9 +53,19 @@ python3 tools/build_laugh.py    # naiwa-videos/glimpse.mp4 -> plugin/data/laugh.
 - **插件在 hook 里拿到的 `$` 是完整引擎**，它调的每个 `$.noun.verb` 都变成事件，测试用 `on(...)` 当实现。
   但 hook 签名永远是 `($, e, next)` —— **第一个参数是 `$` 不是 `e`**，写成 `e => ...` 会拿到引擎对象，
   然后在 `e.path.endsWith` 上炸掉。
-- op 事件的 hook 返回 **`{ value: <结果> }`** 或 `{ deny }`；只有 `tool.call` 是 `{ result }` / `{ deny }`。
-  返回 `{ command: ... }` 这类裸对象会被跳过，然后报 "no implementation for X"，看着像没实现，其实是返回形状错了。
+- **返回形状分两类，别混**：`$.noun.verb` 这类 **op 事件**返回 `{ value: <结果> }` 或 `{ deny }`；
+  **引擎事件**（`prompt.submit` / `ui.render` / `prompt.compose` / `session.start` / `command.run` …）
+  返回**裸结果**。op 事件返回裸对象、或引擎事件多包一层 `{ value }`，都会被跳过，
+  然后报 "no implementation for X"，看着像没实现，其实是返回形状错了。
+- `tool.call` 的 hook 返回 `{ result }` / `{ deny }`，**但 `text` 和 `isError` 只有核心会盖**。
+  测试里的桩如果只回 `{ result: { stdout } }`，插件就读不到「命令挂了」—— 要让插件看见失败，
+  桩得按核心的形状给齐 `{ result, text, isError: true }`。
 - **同一个事件不能 `on` 两次**，会 "hooks module did not load"。用了 `mock.store(on)` 就不要再 `on('store.get')`。
+- **所有 `on(...)` 必须在第一次碰 `$` 之前注册完**，否则 "on(...) after the test first called $"。
+- 插件在 hook 里 `return next(e)` 时，链子**底下必须有人接**（`on('prompt.submit', ...)` 之类），
+  否则 "nothing beneath the plugins answers X"。
+- **模块变量和 atom 活得过同一文件里的下一条 test**。所以每个测试自己的时钟起点不一样时，
+  上一条留下的 `speech.at` 会比这条的 `now` 还大，冷却判定永远不过 —— 症状是「这条测什么都没发生」。
 - `test(name, options, body)` —— options 在**中间**，写在 body 后面文件整个加载不了。
 
 ## 素材事实（已核实，别再重新试）
@@ -69,7 +79,7 @@ python3 tools/build_laugh.py    # naiwa-videos/glimpse.mp4 -> plugin/data/laugh.
 
 ```bash
 claude plugin validate plugin/          # 清单 + 模块 + $.state 契约
-claude plugin test plugin/              # register.test.ts
+claude plugin test plugin/              # register.test.ts，30 条，必须全绿
 
 # 证明插件在真实引擎里加载并注册了 hooks（必须在项目目录外跑，排除 CWD 干扰）
 cd /tmp && claude -p --debug-file /tmp/naiwa-load.log "ok" >/dev/null 2>&1

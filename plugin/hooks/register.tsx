@@ -1,13 +1,19 @@
 /**
- * 奶蛙 · 全部行为。
+ * 奶蛙 · 全部行为（编排层）。
  *
- * 三条硬约束写在 docs/superpowers/specs/2026-10-03-naiwa-mod-design.md，
- * 别绕过去：
+ * 分工：决策全在纯模块里（signals.ts 判场合、lines.ts 出台词、gen.ts 构造与净化
+ * LLM 请求），这个文件只负责「把事件接上、把 `$` 调出去、把状态写回去」。
+ * 之所以这么切，是因为 `$` 只能传进本文件内声明的函数，不能跨 import。
+ *
+ * 四条硬约束，别绕过去：
  *  1. `$.audio.play` 在 Linux 上不播 —— 见 audio.ts。
  *  2. 被动开面板要 ≥144 列（被主动开过一次后 110 列），本机终端 80 列，
- *     所以「下班」自动触发永远落不下面板，只能降级成音频 + 台词 + toast。
+ *     所以自动触发永远落不下面板，只能降级成音频 + 台词 + toast。
  *  3. `$.ui.blit` 在 Raster 未挂载时返回 `{ deny }`（面板被关掉了），
  *     不是错误，直接 cancel 定时器收摊。
+ *  4. **被拦下的命令必须每次都能说话，所以 urgent 场合一次都不读时钟。**
+ *     register.test.ts 的 T1/T2/T4/T5 没搭 `mock.clock`，读一下就是
+ *     "no implementation"。见 signals.ts 的 shouldSpeak。
  */
 
 import { atom, read, update } from 'claude-code'
@@ -19,7 +25,7 @@ import type {
   Timer,
 } from 'claude-code'
 
-import type { Mood, Tally } from '../types'
+import type { Mood, Speech, Tally } from '../types'
 import {
   BIN_DIRS,
   CLIP_ASSET,
@@ -36,7 +42,16 @@ import {
 import type { Platform } from './audio'
 import { ART, ART_COLUMNS, ART_ROWS } from './art'
 import { LAUGH, LAUGH_PALETTE, LAUGH_TRANSPARENT } from './laugh-meta'
-import { DIALECT, pick } from './lines'
+import { DIALECT, MOOD_NAME, fill, reasonOf } from './lines'
+import { MOOD_OF, PRIORITY_OF, describeDanger, occasionOf, shouldSpeak } from './signals'
+import type { Occasion } from './signals'
+import {
+  GEN_MAX_PER_SESSION,
+  GEN_MIN_GAP_MS,
+  MODEL_WORTHY,
+  buildRequest,
+  sanitize,
+} from './gen'
 
 const PANE = 'naiwa'
 const TITLE = '🐸 奶蛙工位'
@@ -44,6 +59,8 @@ const FACE_KEY = 'face'
 const PANE_COLUMNS = 46
 const OFF_WORK_HOUR = 18
 const STORE_OFF_WORK = 'offWorkDate'
+/** /naiwa 开关的真源。跨会话、跨重启，只有它管用。 */
+const STORE_ON = 'isOn'
 
 /** Raster 单元格：`▀` 一行画两像素，前景 = 上、背景 = 下。 */
 const DEFAULT = 0x01000000
@@ -53,60 +70,20 @@ const BLANK = 0x20
 
 const mood = atom({ plugin: 'naiwa', key: 'mood' } as const, 'calm' as Mood)
 const line = atom({ plugin: 'naiwa', key: 'line' } as const, '')
+const reason = atom({ plugin: 'naiwa', key: 'reason' } as const, '')
 const tally = atom({ plugin: 'naiwa', key: 'tally' } as const, {
   edits: 0,
   commands: 0,
   failures: 0,
   blocked: 0,
+  failStreak: 0,
 } as Tally)
 const isDialect = atom({ plugin: 'naiwa', key: 'isDialect' } as const, false)
 const isLaughing = atom({ plugin: 'naiwa', key: 'isLaughing' } as const, false)
-
-/**
- * 破坏性命令。命中就 deny，不放行。
- * 这条规则和 Minus 自己的红线对齐：删文件、动 git 历史、碰密钥，都要先停下来。
- */
-const DANGER = new RegExp(
-  [
-    String.raw`\brm\s+(?:-{1,2}[a-zA-Z]+\s+)*-{1,2}[a-zA-Z]*[rf]`,
-    String.raw`\bgit\s+push\b[^|;&]*--force`,
-    String.raw`\bgit\s+push\b[^|;&]*\s-f(\s|$)`,
-    String.raw`\bgit\s+reset\s+--hard`,
-    String.raw`\bgit\s+clean\s+-{1,2}[a-zA-Z]*[fd]`,
-    String.raw`\bgit\s+branch\s+-D\b`,
-    String.raw`\bmkfs(\.\w+)?\b`,
-    String.raw`\bdd\b[^|;&]*\bof=/dev/`,
-    String.raw`>\s*/dev/[sh]d[a-z]`,
-    String.raw`:\s*\(\s*\)\s*\{[^}]*\}\s*;\s*:`,
-    String.raw`\bchmod\s+-R\s+777\s+/`,
-  ].join('|'),
-  'i',
-)
-
-/** 密钥与凭据文件。命中就 deny —— 这些不进代码、不进 commit。 */
-const PROTECTED = new RegExp(
-  [
-    String.raw`(^|/)\.env(?!\.(example|sample|template|dist))(\.[\w-]+)?$`,
-    String.raw`(^|/)\.ssh/`,
-    String.raw`(^|/)id_(rsa|dsa|ecdsa|ed25519)(\.|$)`,
-    String.raw`\.pem$`,
-    String.raw`(^|/)\.netrc$`,
-    String.raw`(^|/)credentials(\.json)?$`,
-  ].join('|'),
-  'i',
-)
-
-/** 看着像「跑验证」的命令，成功时值得笑一声。 */
-const VERIFY = /\b(test|tests|pytest|vitest|jest|tsc|typecheck|lint|build|make|cargo|gradle|mvn)\b/i
-
-function describeDanger(command: string): string {
-  if (/\brm\b/i.test(command)) return '它会删文件'
-  if (/reset\s+--hard/i.test(command)) return '它会丢掉没提交的改动'
-  if (/--force|\s-f(\s|$)/.test(command)) return '它可能强推、覆盖远端历史'
-  if (/\bmkfs|\bdd\b/i.test(command)) return '它会往裸设备上写'
-  if (/chmod\s+-R\s+777/i.test(command)) return '它会把权限整个放开'
-  return '它是不可逆的破坏性操作'
-}
+const isActive = atom({ plugin: 'naiwa', key: 'isActive' } as const, false)
+/** 一个会话开始时的说话账本：没开过口、没有冷却、没有历史。 */
+const EMPTY_SPEECH: Speech = { at: 0, occasion: '', seq: 0, recent: [] }
+const speech = atom({ plugin: 'naiwa', key: 'speech' } as const, EMPTY_SPEECH)
 
 // ------------------------------------------------------------------ 音效执行
 
@@ -255,26 +232,33 @@ async function loadFrames($: EngineInterface): Promise<Uint8Array | null> {
 /**
  * 大笑彩蛋：音频与动画并行，103 帧播完自停。
  *
- * 属于「用户主动」（按钮或 /naiwa-laugh），所以 80 列也能落面板。
+ * 只管动画本身，**不碰 mood / line / reason** —— 谁来播谁负责说那句话。
+ * 自动彩蛋（celebrate）已经在 `speak` 里把台词和判断依据写好了，这里再写一遍
+ * 就会把「连挂 2 次后跑通」这种依据冲掉，面板上就看不出来它为什么笑。
+ *
+ * 属于「用户主动」（/naiwa-laugh）时 80 列也能落面板，也不受 /naiwa 开关限制
+ * —— 你亲手敲的命令，工具就该听。
  * 任何一条退出路径都必须 cancel 掉定时器，否则面板关了它还在跑。
  */
-async function startLaugh($: EngineInterface, options: PluginOptions): Promise<void> {
+async function startLaugh(
+  $: EngineInterface,
+  options: PluginOptions,
+  /** 自动触发时为 false：没人点它，别为「面板太窄」弹 toast 打扰人。 */
+  announce = true,
+): Promise<void> {
   if (tick !== null) return
-
-  await update($, mood, () => 'laugh')
-  await update($, line, () => pick('laugh', Date.now()))
   void playLaugh($, options)
 
   const opened = await $.ui.open({ id: PANE, title: TITLE, columns: PANE_COLUMNS })
   if (!opened.isPlaced) {
     // 窄终端：面板落不下，动画也就没法 blit。音频和台词照常。
-    $.ui.toast('奶蛙：屏幕太窄，动画放不下 —— 听个响吧，齁齁齁')
+    if (announce) $.ui.toast('奶蛙：屏幕太窄，动画放不下 —— 听个响吧，齁齁齁')
     return
   }
 
   const data = await loadFrames($)
   if (data === null) {
-    $.ui.toast('奶蛙：帧数据没读出来，齁……')
+    if (announce) $.ui.toast('奶蛙：帧数据没读出来，齁……')
     return
   }
 
@@ -315,20 +299,122 @@ async function startLaugh($: EngineInterface, options: PluginOptions): Promise<v
   })
 }
 
-// -------------------------------------------------------------------- 行为
+// ---------------------------------------------------------------- LLM 台词
 
-async function say($: EngineInterface, m: Mood, force = false): Promise<void> {
-  if (!force && (await read($, isLaughing))) return
-  if (!force) await update($, mood, () => m)
-  await update($, line, () => pick(m, Date.now()))
+/** 会话级的调用预算与节流。热重载会重置，可以接受。 */
+let genSpent = 0
+let genLastAt = Number.NEGATIVE_INFINITY
+let genAbort: AbortController | null = null
+
+function resetGenBudget(): void {
+  genSpent = 0
+  genLastAt = Number.NEGATIVE_INFINITY
 }
 
-async function cycle($: EngineInterface): Promise<void> {
-  const order: readonly Mood[] = ['calm', 'angry', 'laugh']
-  const now = await read($, mood)
-  const nextMood = order[(order.indexOf(now) + 1) % order.length]
-  await update($, mood, () => nextMood)
-  await update($, line, () => pick(nextMood, Date.now()))
+type SpeakInput = {
+  occasion: Occasion
+  /** 填进台词槽位的词。 */
+  hit?: string
+  /** 面板上那句判断依据，通常来自 Verdict.why。 */
+  why?: string
+  /** 你的原话，只有 LLM 那一层用得上。 */
+  said?: string
+}
+
+/**
+ * 异步补刀：本地台词已经在屏幕上了，这里失败了就当没发生。
+ *
+ * 三层守卫，任何一层不过都静默返回：
+ *  1. 预算（每会话 3 次、间隔 15s、超时 8s）；
+ *  2. `sanitize`（长度、禁用词、markdown、emoji）；
+ *  3. seq 对账（这期间又开过口就把旧回复丢掉，别让旧话盖新反应）。
+ */
+async function generate($: EngineInterface, input: SpeakInput, seq: number): Promise<void> {
+  if (genSpent >= GEN_MAX_PER_SESSION) return
+  try {
+    const now = await $.clock.now()
+    if (now - genLastAt < GEN_MIN_GAP_MS) return
+    genSpent += 1
+    genLastAt = now
+
+    genAbort?.abort()
+    const controller = new AbortController()
+    genAbort = controller
+
+    // 用会话在用的模型名，跟你在 /model 里看到的一致（实测网关并不拦别的名字，
+    // 但保持一致才不会出现「插件偷偷用了另一个模型」这种事）。
+    const model = await $.session.model()
+    const answer = await $.model.complete(
+      buildRequest(
+        { occasion: input.occasion, hit: input.hit ?? '', userText: input.said ?? '' },
+        model,
+      ),
+      { signal: controller.signal },
+    )
+    if (!answer.isAnswered) return
+
+    const text = sanitize(answer.text)
+    if (text === null) return
+
+    const current = await read($, speech)
+    if (current.seq !== seq) return
+
+    await update($, line, () => text)
+    await update($, speech, s => ({ ...s, recent: [text, ...s.recent].slice(0, 3) }))
+  } catch {
+    // 静默降级：本地台词已经在屏幕上，这里什么都不用做
+  }
+}
+
+/**
+ * 奶蛙开口。
+ *
+ * 三件事一次做完，**心情永远跟着场合走** —— 上一版的 bug 正出在这里：
+ * `say($, 'angry', force=true)` 只换了台词没换 mood，于是拦下危险命令时
+ * 脸还是 calm，只有字变了。现在 `force` 这个双关参数整个删掉，
+ * 「要不要受冷却/开关限制」由 priority 决定，和「写不写 mood」彻底分开。
+ */
+async function speak($: EngineInterface, input: SpeakInput): Promise<void> {
+  if (!(await read($, isActive))) return
+
+  const priority = PRIORITY_OF[input.occasion]
+  // 笑着的时候不插嘴，除非是拦截 —— 那必须立刻反应，并顺手把动画收掉
+  if (priority !== 'urgent' && (await read($, isLaughing))) return
+
+  const previous = await read($, speech)
+  let at = previous.at
+  if (priority === 'notable' || priority === 'normal') {
+    // 只有这两档碰时钟。urgent 的测试环境里压根没有 clock。
+    const now = await $.clock.now()
+    if (!shouldSpeak(priority, previous.at, now)) return
+    at = now
+  }
+  if (priority === 'urgent') stopTicker()
+
+  const hit = input.hit ?? ''
+  const text = fill(input.occasion, hit, previous.recent, Date.now())
+  const seq = previous.seq + 1
+
+  await update($, mood, () => MOOD_OF[input.occasion])
+  await update($, line, () => text)
+  await update($, reason, () => reasonOf(input.occasion, input.why ?? ''))
+  await update($, speech, () => ({
+    at,
+    occasion: input.occasion,
+    seq,
+    recent: [text, ...previous.recent].slice(0, 3),
+  }))
+
+  if (MODEL_WORTHY.includes(input.occasion)) void generate($, input, seq)
+}
+
+/** 闭嘴：把台词条和判断依据一起清掉。关开关时用。 */
+async function hush($: EngineInterface): Promise<void> {
+  stopTicker()
+  await update($, line, () => '')
+  await update($, reason, () => '')
+  await update($, isLaughing, () => false)
+  await update($, mood, () => 'calm')
 }
 
 /** 下班彩蛋的降级版：只放音频 + 台词 + toast，不尝试开面板（80 列落不下）。 */
@@ -345,7 +431,7 @@ async function offWork(
     if ((await $.store.get(STORE_OFF_WORK)) === today) return
     await $.store.set(STORE_OFF_WORK, today)
 
-    await say($, 'laugh', true)
+    await speak($, { occasion: 'offwork' })
     void playLaugh($, options)
     $.ui.toast('🐸 奶蛙：这个点了还写呢？齁齁齁齁齁——')
   } catch {
@@ -353,34 +439,120 @@ async function offWork(
   }
 }
 
+// ------------------------------------------------------------------ 自动彩蛋
+
+/**
+ * 高光时刻才配自动放动画：整套测试跑全绿、或者连挂几次之后翻盘。
+ * 预算卡得很紧 —— 每会话 2 次、两次至少隔 3 分钟。放太勤就不叫彩蛋了。
+ */
+const EGG_MAX_PER_SESSION = 2
+const EGG_MIN_GAP_MS = 180_000
+
+let eggSpent = 0
+let eggLastAt = Number.NEGATIVE_INFINITY
+
+function resetEggBudget(): void {
+  eggSpent = 0
+  eggLastAt = Number.NEGATIVE_INFINITY
+}
+
+async function celebrate(
+  $: EngineInterface,
+  options: PluginOptions,
+  occasion: Occasion,
+): Promise<void> {
+  if (occasion !== 'greenlight' && occasion !== 'recovered') return
+  if (!(await read($, isActive))) return
+  if (eggSpent >= EGG_MAX_PER_SESSION) return
+  try {
+    const now = await $.clock.now()
+    if (now - eggLastAt < EGG_MIN_GAP_MS) return
+    eggSpent += 1
+    eggLastAt = now
+    await startLaugh($, options, false)
+  } catch {
+    // 彩蛋失败不该影响会话
+  }
+}
+
+// -------------------------------------------------------------------- 注册
+
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await detect($)
-    await $.command.register({ name: 'naiwa', description: '打开奶蛙工位面板' })
+    await $.command.register({ name: 'naiwa', description: '叫奶蛙上岗 / 让它下班（开关会记住）' })
     await $.command.register({ name: 'naiwa-laugh', description: '奶蛙大笑彩蛋：动画 + 配音 + 台词' })
     await $.command.register({ name: 'naiwa-talk', description: '开关奶蛙口吻（注入 system prompt）' })
+
+    resetGenBudget()
+    resetEggBudget()
+
+    // 新会话 = 新的账本。atom 活得过热重载（也活得过同一进程里的下一场会话），
+    // 不清的话上一场的冷却和「最近说过什么」会带进来 —— 最直观的症状是
+    // 开场那句寒暄被上一场的冷却压掉，奶蛙一声不吭。
+    await update($, speech, () => EMPTY_SPEECH)
+    // 同理，上一场留在屏幕上的台词不该跨会话显示。
+    await hush($)
+
+    // $.store 的值变化不会触发重绘，必须镜像进 atom 面板才会刷新。
+    const isOn = (await $.store.get(STORE_ON)) === true
+    await update($, isActive, () => isOn)
+
+    if (!isOn) {
+      $.ui.status('🐸 奶蛙待命 · 敲 /naiwa 叫它')
+      return next(e)
+    }
+
     $.ui.status('🐸 奶蛙在岗 · 齁齁齁')
-    void offWork($, e, options)
+    await offWork($, e, options)
+    // 下班彩蛋已经说过话了就不再寒暄
+    if ((await read($, line)) === '') await speak($, { occasion: 'greeting' })
     return next(e)
   })
 
   on('command.run', { command: 'naiwa' }, async ($, e, next) => {
+    const isOn = !(await read($, isActive))
+    await update($, isActive, () => isOn)
+    await $.store.set(STORE_ON, isOn)
+
+    if (!isOn) {
+      await hush($)
+      await $.ui.close({ id: PANE })
+      return { text: '🐸 奶蛙：那奶蛙先下班了。开关记住了，下次不会再自己冒出来。' }
+    }
+
+    // 你亲手敲的命令 = "asked" 路径，80 列也能落下面板
     const opened = await $.ui.open({ id: PANE, title: TITLE, columns: PANE_COLUMNS })
-    if (!opened.isPlaced) return { text: `🐸 面板没能放下来（${opened.reason}）—— 加宽终端到 110 列再试。` }
-    return next(e)
+    // 你亲手叫的，不受冷却限制（同 /naiwa-laugh 的 bypass 语义）：把上次开口时间
+    // 退回原点。不退的话「关掉又立刻打开」会撞上 8 秒冷却 —— 面板开了，
+    // 台词条却是空的（hush 刚清过），看着像坏了。
+    await update($, speech, s => ({ ...s, at: 0 }))
+    await speak($, { occasion: 'greeting' })
+    // 不回 `next(e)`：插件自己注册的命令底下没有核心行为可让，
+    // 而且 `next` 的参数必须是合法的 `CommandRunInput`（`args` 是必填的），
+    // 拿引擎给的 `e` 原样往回传在测试环境里会直接被拒。直接给结果最省事。
+    if (!opened.isPlaced) {
+      return { text: `🐸 奶蛙来了（面板放不下：${opened.reason}）—— 加宽终端到 110 列再试。` }
+    }
+    return { text: '🐸 奶蛙上岗了。齁齁齁，要它下班再敲一次 /naiwa。' }
   })
 
   on('command.run', { command: 'naiwa-laugh' }, async $ => {
+    // 你亲手敲的，不受 /naiwa 开关限制（那个开关管的是「它自己冒不冒出来」）。
+    // 台词也得在这里写 —— startLaugh 只管动画，见它的注释。
+    await update($, mood, () => MOOD_OF.manual)
+    await update($, line, () => fill('manual', '', [], Date.now()))
+    await update($, reason, () => reasonOf('manual'))
     await startLaugh($, options)
     return { text: '🐸 奶蛙：哈哈哈哈哈哈哈哈哈哈哈哈哈哈' }
   })
 
-  on('command.run', { command: 'naiwa-talk' }, async ($, e, next) => {
+  on('command.run', { command: 'naiwa-talk' }, async $ => {
     const isOn = !(await read($, isDialect))
     await update($, isDialect, () => isOn)
     return isOn
       ? { text: '🐸 奶蛙口吻：开了。齁齁齁，不过技术结论还是照实说。' }
-      : next(e)
+      : { text: '🐸 奶蛙口吻：关了。' }
   })
 
   on('prompt.compose', async ($, e, next) => {
@@ -396,16 +568,21 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    await say($, 'calm')
+    const said = e.text
+    const verdict = occasionOf({ kind: 'prompt', text: said })
+    if (verdict !== null) {
+      await speak($, { occasion: verdict.occasion, hit: verdict.hit, why: verdict.why, said })
+    }
     return next(e)
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const command = String(e.command ?? '')
 
-    if (DANGER.test(command)) {
+    const call = occasionOf({ kind: 'bashCall', command })
+    if (call !== null) {
       await update($, tally, t => ({ ...t, blocked: t.blocked + 1 }))
-      await say($, 'angry', true)
+      await speak($, { occasion: call.occasion, hit: call.hit, why: call.why })
       $.ui.toast('🐸 奶蛙：这条命令奶蛙给你摁住了')
       return {
         deny: `🐸 奶蛙拦下了这条命令：${describeDanger(command)}。真要跑，请在 Claude Code 之外的终端里自己执行。`,
@@ -414,28 +591,45 @@ export const register: Register = (on, options) => {
 
     await update($, tally, t => ({ ...t, commands: t.commands + 1 }))
     const ran = await next(e)
-    const isRed = ran.isError === true || /Exit code [1-9]\d*/.test(ran.text ?? '')
+    const isError = ran.isError === true || /Exit code [1-9]\d*/.test(ran.text ?? '')
 
-    if (ran.deny === undefined && isRed) {
-      await update($, tally, t => ({ ...t, failures: t.failures + 1 }))
-      await say($, 'angry')
-    } else if (ran.deny === undefined && VERIFY.test(command)) {
-      await say($, 'laugh')
+    // 连续失败数要在写入前取：`recovered` 判的是「这次成功之前的连挂次数」。
+    const before = (await read($, tally)).failStreak
+    await update($, tally, t => ({
+      ...t,
+      failures: t.failures + (isError ? 1 : 0),
+      failStreak: isError ? before + 1 : 0,
+    }))
+
+    if (ran.deny === undefined) {
+      const result = occasionOf({
+        kind: 'bashResult',
+        command,
+        isError,
+        text: ran.text ?? '',
+        failStreak: before,
+      })
+      if (result !== null) {
+        await speak($, { occasion: result.occasion, hit: result.hit, why: result.why })
+        await celebrate($, options, result.occasion)
+      }
     }
     return ran
   })
 
   for (const tool of ['Edit', 'Write'] as const) {
     on('tool.call', { tool }, async ($, e, next) => {
-      if (PROTECTED.test(e.file_path)) {
+      const call = occasionOf({ kind: 'writeCall', path: e.file_path })
+      if (call !== null) {
         await update($, tally, t => ({ ...t, blocked: t.blocked + 1 }))
-        await say($, 'angry', true)
+        await speak($, { occasion: call.occasion, hit: call.hit, why: call.why })
         return {
           deny: `🐸 奶蛙不让动 ${e.file_path} —— 密钥和凭据文件不进代码、不进 commit。真要改，请你自己来。`,
         }
       }
       const ran = await next(e)
       if (ran.deny === undefined && ran.isError !== true) {
+        // 编辑成功不开口，只记数 —— 说话太密本身就是上一版的毛病
         await update($, tally, t => ({ ...t, edits: t.edits + 1 }))
       }
       return ran
@@ -443,8 +637,10 @@ export const register: Register = (on, options) => {
   }
 
   on('turn.complete', async ($, e, next) => {
-    if (e.reason === 'answer') await say($, 'calm')
-    else if (e.reason === 'error' || e.reason === 'aborted') await say($, 'angry')
+    const verdict = occasionOf({ kind: 'turn', reason: e.reason })
+    if (verdict !== null) {
+      await speak($, { occasion: verdict.occasion, hit: verdict.hit, why: verdict.why })
+    }
     return next(e)
   })
 
@@ -460,10 +656,16 @@ export const register: Register = (on, options) => {
     )
   })
 
+  // 面板上没有任何可点的东西：心情是奶蛙自己判的，不是你按出来的。
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
-    const { Box, Text, Button, Raster } = elements
-    const [m, text, t] = [await read($, mood), await read($, line), await read($, tally)]
+    const { Box, Text, Raster } = elements
+    const [m, text, why, t] = [
+      await read($, mood),
+      await read($, line),
+      await read($, reason),
+      await read($, tally),
+    ]
     const face = e.surface === 'terminal' && Raster !== undefined ? artCells(m) : null
 
     return (
@@ -475,13 +677,12 @@ export const register: Register = (on, options) => {
         )}
         <Text color="#FCDF69">「{text === '' ? '齁齁齁。' : text}」</Text>
         <Text dimColor>
+          心情：{MOOD_NAME[m]}
+          {why === '' ? '' : ` · ${why}`}
+        </Text>
+        <Text dimColor>
           编辑 {t.edits} · 命令 {t.commands} · 失败 {t.failures} · 拦截 {t.blocked}
         </Text>
-        <Box>
-          <Button key="laugh" label="大笑" variant="primary" onPress={() => void startLaugh($, options)} />
-          <Text> </Text>
-          <Button key="cycle" label="换个表情" onPress={() => void cycle($)} />
-        </Box>
       </Box>
     )
   })
