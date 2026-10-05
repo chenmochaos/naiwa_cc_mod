@@ -1,0 +1,31 @@
+{
+  "name": "naiwa",
+  "owner": {
+    "name": "Minus",
+    "url": "https://github.com/chenmochaos"
+  },
+  "metadata": {
+    "description": "奶蛙（Naiwa）——住进 Claude Code 终端的桌宠插件",
+    "version": "0.3.1"
+  },
+  "plugins": [
+    {
+      "name": "naiwa",
+      "source": "./plugin",
+      "description": "奶蛙在终端里陪你写代码：能读懂上下文的台词、自己切换的心情、危险命令拦截，外加高光时刻的自动大笑彩蛋。",
+      "version": "0.3.1",
+      "author": {
+        "name": "Minus"
+      },
+      "homepage": "https://github.com/chenmochaos/naiwa_cc_mod",
+      "repository": "https://github.com/chenmochaos/naiwa_cc_mod",
+      "keywords": [
+        "claude-code",
+        "plugin",
+        "desktop-pet",
+        "terminal"
+      ],
+      "category": "fun"
+    }
+  ]
+}
