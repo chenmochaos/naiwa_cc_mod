@@ -54,16 +54,21 @@ claude --plugin-dir /绝对路径/到/naiwa_cc_mod/plugin
 | `/naiwa-laugh` | 播完整彩蛋：**103 帧动画 + 原声配音 + 台词条**同时动，约 10.3 秒 |
 | `/naiwa-talk` | 开关奶蛙口吻（会注入 system prompt）。默认**关** |
 
-打开 `/naiwa` 后的面板：像素头像 + 当前台词 + **心情**（平静 / 生气 / 大笑）+ **判断依据** + 计数。
+打开 `/naiwa` 后的面板：像素头像 + 当前台词 + **心情**（平静 / 生气 / 大笑 / 失落）+ **判断依据** + 计数。
 面板上**没有任何需要你点的东西** —— 心情是奶蛙自己判的，不是按出来的。
+
+面板里的脸有**三档尺寸**（44×26 / 26×15 / 22×6），按终端实际给面板多少行自动选：
+140×40 的停靠面板上能画全身像，80×24 里只剩 6 行，那就换小脸 ——
+不管哪种终端，**只要面板在，奶蛙的脸就在**（矮到连小脸都放不下就退成纯文字，面板仍然在）。
 
 不用敲命令也会自己动的部分：
 
 - **台词跟着你说的话走**。你提 `bug` 它就引用 `bug`，你说"终于上线了"它跟着庆祝。
   关键时刻（开场寒暄 / 你不顺 / 你在乐 / 报里程碑）还会调一次 LLM 现编一句，
   失败就静默用本地台词，**不报错、不卡、不瞎编技术判断**。
-- **心情自己切换**。说到好玩的 `laugh`，命令挂了 / 连着报错 `angry`，
-  你烦的时候它不跟着烦（生气的对象是危险命令，不是你）。
+- **心情自己切换**。说到好玩的 `laugh`；命令挂了、测试挂了、你说丧气话 → `sad`（失落）；
+  拦下危险命令、有人要动密钥 → `angry`（生气）。
+  **生气和失落分工明确**：生气瞪的是那件危险的事，失落陪的是你 —— 挂了个测试就冲你瞪眼，那读起来是它在怪你。
 - **危险命令拦截**：命中就 deny，**脸和台词一起变生气** + toast，命令**根本不会交给引擎**。
   拦 `rm -rf`、`git push --force/-f`、`git reset --hard`、`git clean -fd`、`git branch -D`、`mkfs`、
   `dd of=/dev/*`、`> /dev/sd*`、fork 炸弹、`chmod -R 777 /`。
@@ -101,11 +106,14 @@ TTS 走 `spd-say`（其次 `espeak-ng`、`espeak`），macOS 上是 `$.audio.spe
 音效模式在 `/config` 里改，或改 `plugin.json` 的 `userConfig.audio`：
 `clip`（默认）/ `tts` / `off`。任何一步失败都被吞成静音 —— **彩蛋不该因为没声音就报错**。
 
-### 终端宽度
+### 终端宽度与面板
 
-- **`/naiwa`、`/naiwa-laugh` 是你主动敲的**（属于 "asked"），80 列也能落下面板。
-- **自动触发（下班彩蛋）永远不主动开面板** —— 被动开面板要求 ≥144 列，被开过一次后才降到 110 列，
-  80 列的终端落不下。降级成音频 + 台词 + toast，这是 `$.ui.open` 返回 `{ isPlaced: false }` 的正常分支。
+- **你亲手敲的命令、你发的消息都算 "asked"，任何宽度都落得下面板。** 你主动敲的
+  `/naiwa`、`/naiwa-laugh` 是这条；**你发消息**也是 —— 这条是 80 列终端的关键：
+  `session.start` 里那次开面板没人要求（"unasked"），要 ≥144 列（这个面板被开过一次才降到 110），
+  80 列下它会挂起不画。所以插件在 `prompt.submit` 里又开了一次，你一打字面板就上来。
+- **面板能拿多少行是引擎定的**，不是插件要的（`$.ui.open({ rows })` 实测无效）。
+  插件读 `Pane` 的 `scroll.bodyRows` 决定画哪一档脸，见 `plugin/hooks/faces.ts`。
 - 面板被关掉时 `$.ui.blit` 返回 `{ deny }`，插件立刻 cancel 定时器收摊，不会在后台空转。
 
 ### `plugin/.claude-plugin/types/` 不在仓库里
@@ -116,12 +124,13 @@ TTS 走 `spd-say`（其次 `espeak-ng`、`espeak`），macOS 上是 `$.audio.spe
 
 ### 生成物别手改
 
-`plugin/hooks/art.ts`、`plugin/hooks/laugh-meta.ts`、`plugin/data/laugh.bin`、`plugin/assets/laugh.mp3`
-都是**生成物**，改它们 = 改 `tools/` 再重跑：
+`plugin/data/faces.bin`、`plugin/hooks/face-meta.ts`、`plugin/hooks/laugh-meta.ts`、
+`plugin/data/laugh.bin`、`plugin/assets/laugh.mp3` 都是**生成物**，改它们 = 改 `tools/` 再重跑：
 
 ```bash
-python3 tools/build_art.py      # naiwa-images/ + 视频第 270 帧 -> plugin/hooks/art.ts
-python3 tools/build_laugh.py    # naiwa-videos/glimpse.mp4   -> plugin/data/laugh.bin + assets/laugh.mp3
+python3 tools/build_art.py         # naiwa-images/ + 视频第 270 帧 -> data/faces.bin + hooks/face-meta.ts
+python3 tools/build_art.py --preview   # 同上，另出一张 12 格核对图（改裁剪框后必看）
+python3 tools/build_laugh.py       # naiwa-videos/glimpse.mp4 -> data/laugh.bin + assets/laugh.mp3
 ```
 
 需要 `python3` + `numpy` + `Pillow`，以及 `ffmpeg`（解码视频、剪音频）。
@@ -134,13 +143,14 @@ python3 tools/build_laugh.py    # naiwa-videos/glimpse.mp4   -> plugin/data/laug
 
 ```bash
 claude plugin validate plugin/   # 清单 + 模块 + $.state 契约
-claude plugin test plugin/       # 30 个测试
+claude plugin test plugin/       # 34 个测试
 ```
 
 测试覆盖：危险命令与密钥文件的 deny（并确认命令**没有**被放行给引擎）、口吻开关对 `prompt.compose` 的影响、
-Linux 音效真的走 `paplay` 而**绝不**调 `$.audio.play`、103 帧动画逐格还原（含透明像素）后自停、
-下班降级路径不试图开面板；以及 v0.2 新增的台词相关性、LLM 补刀与四种静默降级、
-心情随场合切换、冷却、持久开关、彩蛋门槛、**面板上没有任何按钮**、判定表与模板长度。
+Linux 音效真的走 `paplay` 而**绝不**调 `$.audio.play`、103 帧动画逐格还原（含透明像素）后自停；
+v0.2 的台词相关性、LLM 补刀与四种静默降级、心情随场合切换、冷却、持久开关、彩蛋门槛、
+**面板上没有任何按钮**、判定表与模板长度；以及 v0.3.0 的**面板分档**（行数 → 脸的大小与文字行数、
+真渲染出的 Raster 尺寸）、**asked 时机补开面板**、失败 → 失落而危险命令 → 生气。
 
 写测试前先读 `plugin/hooks/register.test.ts` 顶部的注释 —— 这个测试环境有几条反直觉的规则，
 不了解的话会白折腾很久：

@@ -12,7 +12,7 @@ Claude Code ≥ 2.1.287 的原生插件（不是第三方框架）。它在终�
 | 目录 | 放什么 | 规则 |
 | --- | --- | --- |
 | `plugin/` | **插件本体，唯一的交付物** | 这里的内容必须自洽：能被 `claude plugin validate` 通过、能软链进 dev-mods 直接跑。不放任何开发期脚本 |
-| `plugin/hooks/` | `register.tsx` 编排 + `signals.ts`（场合判定/安全正则/冷却）、`gen.ts`（LLM 请求与净化）、`lines.ts`（模板与理由）、`audio.ts`、`art.ts` | 逻辑集中在一个 `register.tsx`，其余是纯数据或纯函数，不反向依赖 register；**碰 `$` 的代码只能写在 register.tsx** |
+| `plugin/hooks/` | `register.tsx` 编排 + `signals.ts`（场合判定/安全正则/冷却）、`faces.ts`（面板分档）、`gen.ts`（LLM 请求与净化）、`lines.ts`（模板与理由）、`audio.ts`、`*-meta.ts`（生成物） | 逻辑集中在一个 `register.tsx`，其余是纯数据或纯函数，不反向依赖 register；**碰 `$` 的代码只能写在 register.tsx** |
 | `plugin/data/` `plugin/assets/` | 二进制素材（帧数据、音频） | **只能由 `tools/` 生成，禁止手改** |
 | `tools/` | 从原始素材生成 `plugin/` 内容的 Python 流水线 | 每个脚本独立可跑、输出确定；跑完打 SHA-256 打印出来 |
 | `naiwa.md` `naiwa-images/` `naiwa-videos/` | Minus 提供的原始素材 | **只读，永不修改** |
@@ -21,21 +21,33 @@ Claude Code ≥ 2.1.287 的原生插件（不是第三方框架）。它在终�
 
 ## 生成物 vs 手写物
 
-`plugin/hooks/art.ts`、`plugin/data/laugh.bin`、`plugin/assets/laugh.mp3` 是**生成物**，
-文件头会写明来源脚本。改它们 = 改 `tools/` 再重跑：
+`plugin/data/faces.bin`、`plugin/hooks/face-meta.ts`、`plugin/data/laugh.bin`、
+`plugin/hooks/laugh-meta.ts`、`plugin/assets/laugh.mp3` 是**生成物**，文件头会写明来源脚本。
+改它们 = 改 `tools/` 再重跑：
 
 ```bash
-python3 tools/build_art.py      # naiwa-images/ + 视频帧  -> plugin/hooks/art.ts
-python3 tools/build_laugh.py    # naiwa-videos/glimpse.mp4 -> plugin/data/laugh.bin + plugin/assets/laugh.mp3
+python3 tools/build_art.py                 # 四表情 × 三档 -> plugin/data/faces.bin + plugin/hooks/face-meta.ts
+python3 tools/build_art.py --preview       # 顺手把 12 张图拼成 _design-preview/30-art核对.png
+python3 tools/build_laugh.py               # naiwa-videos/glimpse.mp4 -> plugin/data/laugh.bin + plugin/assets/laugh.mp3
 ```
 
-其余文件手写。
+其余文件手写。**淘汰记录**：v0.2 的 `plugin/hooks/art.ts`（44×26 单尺寸 TS 字面量网格）
+已被 `faces.bin` 取代并删除 —— 单一尺寸在某些终端上必然被裁，这是 v0.3.0 修的 bug。
 
 ## 硬约束（踩过的坑，别再踩）
 
 - **`$.audio.play({asset})` 在 Linux 上不播任何东西。** 官方文档明说：`afplay` 只在 macOS 可用，Linux/Windows "having no player, plays nothing"。Linux 必须走 `$.process.run(['paplay', ...])`。
 - **`$.audio.speak` 是 macOS 的 `say`。** Linux 退路是 `spd-say`。
-- **被动开面板要 ≥144 列终端，被开过一次后降到 110 列。** 本机终端 80 列，所以**自动触发永远落不下面板**；`$.ui.blit` 在 Raster 未挂载时返回 `{ deny }`，自动触发也放不了动画。动画只走用户主动路径（`/naiwa-laugh` 属于 "asked"，80 列也能落）。
+- **开面板分「asked」和「unasked」，宽度门槛天差地别。**
+  asked（你敲的命令 / 你发的消息 / 你按的按钮）**任何宽度都落**；unasked（`session.start`、定时器、队列里的 prompt）
+  要 ≥144 列，这个 id 以前被人开过才降到 110。本机 80 列 —— 所以**只有 asked 时机拿得到面板**。
+  v0.3.0 的解法是把开面板挪到 `prompt.submit`（见 `ensurePane`），不是去调宽度。
+- **面板高度是引擎给的，不是你要的。** 实测：80×24 → 6 行，80×40 → 11 行，80×60 → 18 行，
+  140×24 → 16 行，140×40 → 32 行。`$.ui.open({ rows: N })` **实测无效**（传 30 和不传一样）。
+  任何往面板里画固定高度东西的代码，都必须先问 `e.props.scroll.bodyRows` —— v0.2「打开了却看不到奶蛙」
+  就是因为 26 行的脸被塞进 6 行的面板。
+- **`$.ui.blit` 在 Raster 未挂载时返回 `{ deny }`**（面板被关掉了），不是错误。动画只走用户主动路径
+  （`/naiwa-laugh` 属于 asked，80 列也能落）。
 - **`$.ui.blit` 的定时器必须在所有退出路径上 `cancel()`**，否则面板关了动画还在跑。
 - **热重载会重置模块变量。** 跨会话/跨重载要留的值走 `$.store`；会话内的走 `atom`/`read`/`update`。
 - **`--plugin-dir` 和 dev-mods 都是 session-only 的，活不过重启。** 官方原文 "Load a plugin from a
@@ -70,21 +82,38 @@ python3 tools/build_laugh.py    # naiwa-videos/glimpse.mp4 -> plugin/data/laugh.
 
 ## 素材事实（已核实，别再重新试）
 
-- `naiwa-images/大笑.jpg` 和 `伤心失落.jpg` 是 **3/4 背身视角，没有脸**，四组更紧的裁剪框都救不回来 → **不做"伤心"表情**，"大笑"静态图从视频帧取。
+- **`伤心失落.jpg` 有脸**（3/4 侧身低头，一只垂眼 + 下撇的嘴，肩膀垮着），裁剪框 `(0.00, 0.00, 0.42, 0.44)`。
+  v0.2 时这里曾记「背身没脸、不做伤心表情」—— **那条是错的**，当时裁错了框就下了结论。已作废。
+- `naiwa-images/大笑.jpg` 同样没被采用，「大笑」静态图取自视频第 270 帧。
 - 视频第 396 帧之后是"笑到倒地"。横躺构图在 44×26 里必然糊，**动画砍在 356 帧**。
 - 所有素材背景都是纯白 `255,255,255`。奶蛙肚子是 `248,240,216`（min 216）—— 判背景的规则不能误伤肚子。
-- 画布固定 **44 列 × 26 行**（44×52 像素，半块字符 `▀`，`0x01000000` = 透明）。
+- 裁剪框是**人工标注**的，不要改成自动暗部检测（会抓到深色手部/阴影而不是脸，试过两轮都失败）。
+  改框之后必须 `--preview` 肉眼确认。
+- 画布三档：**44×26（full）/ 26×15（mid）/ 22×6（mini）**，都由同一个裁剪框渲染。
+  半块字符 `▀`/`▄`，`0x01000000` = 透明。选档规则见 `plugin/hooks/faces.ts`。
 
 ## 验证（改完必须跑，不要只改不验）
 
 ```bash
 claude plugin validate plugin/          # 清单 + 模块 + $.state 契约
-claude plugin test plugin/              # register.test.ts，30 条，必须全绿
+claude plugin test plugin/              # register.test.ts，34 条，必须全绿
 
 # 证明插件在真实引擎里加载并注册了 hooks（必须在项目目录外跑，排除 CWD 干扰）
 cd /tmp && claude -p --debug-file /tmp/naiwa-load.log "ok" >/dev/null 2>&1
-grep -c 'hooks module naiwa@inline loaded' /tmp/naiwa-load.log   # 期望 1
+grep -c 'hooks module naiwa@inline loaded' /tmp/naiwa-load.log   # 期望 1（日志是追加的，数这次那行）
 grep -o 'Found [0-9]* plugins' /tmp/naiwa-load.log               # 期望 9（8 个原有 + naiwa）
+```
+
+**真机面板复现**（改面板/表情必跑，脚本在 `/tmp/naiwa_pty.py` + `/tmp/screen.py`）：
+起一个真 pty 会话，发一条消息，把字节流还原成屏幕，肉眼确认面板里有脸 + 台词 + 心情。
+`/tmp/screen.py <raw> <cols> <rows>` 是那个 ANSI 还原器（纯文本 grep 看不到像素画，
+因为半个方块字符会被 ANSI 清理掉 —— 别用它下「面板没画」的结论）。
+判定「引擎到底放没放进面板」看 debug 日志，别猜：
+
+```bash
+grep -oE "ui\.open naiwa naiwa \([a-z]+, [0-9]+ columns\): [a-z ]+" /tmp/pane-*.log
+# 80 列上期望同时出现： (unasked, 80 columns): waits unplaced   ← session.start 那次，正常
+#                        (asked, 80 columns): placed            ← prompt.submit 那次，这就是修复点
 ```
 
 加载方式（`~/.claude/settings.json` 的 `CLAUDE_CODE_PLUGIN_DIRS`）见 README 的「装」一节。

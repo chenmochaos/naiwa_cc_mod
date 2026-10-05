@@ -42,16 +42,22 @@ export type Occasion =
  */
 export type Priority = 'urgent' | 'notable' | 'normal' | 'bypass'
 
+/**
+ * 场合 → 表情。**生气和失落分工明确，别混**：
+ *  - `angry` 对着「危险动作」—— 拦下的命令、要动密钥的手。它瞪的是那件事。
+ *  - `sad` 对着「不顺」—— 你说丧气话、命令/测试挂了。它陪的是你。
+ * 把失败画成生气，读起来就成了「奶蛙在怪你」，正好反了。
+ */
 export const MOOD_OF: Record<Occasion, Mood> = {
   greeting: 'calm',
-  frustrated: 'calm',
+  frustrated: 'sad',
   banter: 'laugh',
   milestone: 'laugh',
   prompt: 'calm',
   turnfail: 'angry',
   blocked: 'angry',
   secret: 'angry',
-  fail: 'angry',
+  fail: 'sad',
   green: 'laugh',
   greenlight: 'laugh',
   recovered: 'laugh',

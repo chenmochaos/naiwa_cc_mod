@@ -23,6 +23,7 @@
 import type { Engine, ModelCompleteRequest, ModelCompleteResult, On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
+import { chooseLayout } from './faces'
 import { MAX_LINE, sanitize } from './gen'
 import { LAUGH, LAUGH_PALETTE } from './laugh-meta'
 import { TEMPLATES, renderTemplate } from './lines'
@@ -132,6 +133,9 @@ function engine(on: On, bins: readonly string[] = [], init: Init = {}): Stubs {
     s.closed.push(e.id)
     return { value: undefined }
   })
+  // `ensurePane` 先问一句「面板在不在台上」。这里固定回「不在」，
+  // 于是每次 asked 时机都会重开一次 —— 那正是插件要的行為。
+  on('ui.panes', () => ({ value: [] as const }))
   on('ui.blit', (_$, e) => {
     s.blits.push(e.cells)
     return { value: {} }
@@ -246,6 +250,32 @@ function paneText($: Engine): Promise<string> {
     const texts = await ui.findAll({ type: 'Text' })
     return texts.map(t => t.text).join('\n')
   })
+}
+
+/**
+ * 面板上那张脸的画布尺寸。用 `terminal` 挂 —— 只有终端表面有 `Raster`，
+ * `desktop` 走的是「画个文字头像」那条分支（`paneText` 就是那么挂的）。
+ * 返回 `undefined` = 这个高度下压根没画脸。
+ */
+async function paneFace(
+  $: Engine,
+  bodyRows: number,
+): Promise<{ columns: number; rows: number } | undefined> {
+  const ui = await $.ui.mount({
+    plugin: 'naiwa',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'naiwa',
+    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } },
+  })
+  try {
+    const found = await ui.find({ type: 'Raster' })
+    return found === undefined
+      ? undefined
+      : { columns: Number(found.props.columns), rows: Number(found.props.rows) }
+  } finally {
+    await ui.unmount()
+  }
 }
 
 /** 台词条上那句话。空串 = 奶蛙没开口。 */
@@ -502,7 +532,7 @@ test('blit 出去的 cells 精确还原帧数据（含透明像素）', async ($
 
 // ------------------------------------------------------------------ 下班彩蛋
 
-test('下班触发降级：不试图开面板，但台词和音效照常', async ($, on) => {
+test('下班彩蛋：台词和音效照常，面板也照样去要（落不落座由引擎定）', async ($, on) => {
   const s = engine(on, ['paplay'], { stored: { isOn: true } })
   const clock = mock.clock(on, { now: new Date(2026, 9, 3, 20, 0, 0).getTime() })
   // store 的桩已经在 engine() 里了，不能再叠一层 mock.store，
@@ -512,8 +542,11 @@ test('下班触发降级：不试图开面板，但台词和音效照常', async
   await $.session.start({ ...SESSION, isInteractive: true })
   await clock.settle()
 
-  expect(s.opened).toBe(0) // 80 列落不下面板，压根不试
-  expect(has(s, CLIP)).toBe(true) // 但得听个响
+  // v0.3.0 起这里从 0 变 1：以前「80 列落不下就压根不试」，结果宽终端上
+  // 面板也永远不出现。现在一律去要 —— 窄终端引擎会挂起不画（桩替不了这个），
+  // 宽终端当场落地。落不落座是引擎的决定，插件只管把话说出去。
+  expect(s.opened).toBe(1)
+  expect(has(s, CLIP)).toBe(true) // 得听个响
   expect(s.toasts.some(t => t.includes('这个点了还写呢'))).toBe(true)
 })
 
@@ -540,8 +573,9 @@ test('台词跟着用户的话走：说了 bug，台词里就有 bug', async ($,
   const text = await bandText($)
   // 这是 Minus 的原始投诉：上一版这里会随机蹦出「我没有破防，我只是在加载笑声」
   expect(text.includes('bug')).toBe(true)
-  // 他烦的时候奶蛙不该跟着生气（生气的对象是危险命令，不是他）
-  expect((await paneText($)).includes('心情：平静')).toBe(true)
+  // 他烦的时候奶蛙不该跟着生气（生气的对象是危险命令，不是他）——
+  // v0.3.0 起这一格从「平静」改成「失落」：以前是面无表情地听着。
+  expect((await paneText($)).includes('心情：失落')).toBe(true)
   expect(s.asks.length).toBeGreaterThan(0) // 补刀确实派出去了
 })
 
@@ -803,14 +837,28 @@ test('/naiwa 是持久开关：开一次，以后每次会话自动在场', asyn
   ])
 })
 
-test('开关已经打开时，新会话自动出现，但不主动抢面板', async ($, on) => {
+test('开关已经打开时：新会话主动把面板叫上来，台词条也常驻', async ($, on) => {
   const s = engine(on, [], { stored: { isOn: true } })
   const clock = mock.clock(on, { now: 1_000_000 })
   await $.session.start(SESSION)
   await clock.settle()
 
   expect(await bandText($)).not.toBe('') // 台词条常驻
-  expect(s.opened).toBe(0) // 80 列落不下，不试（降级成台词条）
+  // v0.3.0 起从 0 变 1，和上一条同理：以前不试 = 宽终端上也看不到面板。
+  expect(s.opened).toBe(1)
+})
+
+test('你一发消息，窄终端里的面板也会被叫上来（asked 时机）', async ($, on) => {
+  const s = engine(on, [], { stored: { isOn: true } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await warmUp($, clock)
+  const atStart = s.opened
+
+  await $.prompt.submit({ text: '帮我看下这个报错' })
+
+  // `session.start` 那次在 80 列上是石沉大海（引擎只让 asked 的落座），
+  // 所以真正的抓手是这个：prompt.submit 也是 asked，任何宽度都落。
+  expect(s.opened).toBe(atStart + 1)
 })
 
 // ------------------------------------------------------------------ 面板形态
@@ -840,6 +888,63 @@ test('面板上没有任何可点的东西，只显示心情和判断依据', as
   } finally {
     await ui.unmount()
   }
+})
+
+test('命令失败：失落，不是生气 —— 生气只留给危险命令', async ($, on) => {
+  engine(on, [], { stored: { isOn: true } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // text 和 isError 得按核心的形状给齐：只回 `{ result }` 的话插件读不到
+  // 「命令挂了」，fail 那个场合压根不会触发（见文件头的测试环境说明）
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: 'boom' },
+    text: 'Exit code 1',
+    isError: true,
+  }))
+  await warmUp($, clock)
+
+  await $.tool.call({ tool: 'Bash', command: 'pytest -q' })
+
+  const pane = await paneText($)
+  expect(pane.includes('心情：失落')).toBe(true)
+})
+
+// ------------------------------------------------------- 面板分档（v0.3.0）
+
+test('分档表：面板行数 → 脸的大小与留几行字', async () => {
+  // 左边是**实测的面板行数**（见 faces.ts 头注释），不是猜的。
+  // 核心诉求：行数够就上大脸，不够就降档，绝不把 26 行的脸塞进 6 行的面板。
+  const table: readonly (readonly [number, { tier: string | null; lines: number }])[] = [
+    [32, { tier: 'full', lines: 3 }], // 140×40 dock：脸和字都齐
+    [29, { tier: 'full', lines: 3 }], // full 的下限（26 + 3）
+    [27, { tier: 'full', lines: 1 }], // 只挤得出一行字
+    [26, { tier: 'mid', lines: 3 }], // full 会把字全挤掉 → 退一档保台词
+    [18, { tier: 'mid', lines: 3 }], // 80×60 inline
+    [16, { tier: 'mid', lines: 1 }], // mid 的下限（15 + 1）
+    [15, { tier: 'mini', lines: 3 }],
+    [11, { tier: 'mini', lines: 3 }], // 80×40 inline
+    [7, { tier: 'mini', lines: 1 }], // mini 的下限（6 + 1）
+    [6, { tier: 'mini', lines: 0 }], // 80×24 inline：一行字都挤不下，但脸在
+    [5, { tier: null, lines: 3 }], // 比迷你档还矮 → 纯文字，面板仍然是面板
+    [0, { tier: 'mini', lines: 3 }], // 拿不到行数：按最保守的一档走，宁可切字不切脸
+  ]
+  for (const [rows, want] of table) {
+    expect([rows, chooseLayout(rows)]).toEqual([rows, want])
+  }
+})
+
+test('面板按真实行数画脸：矮终端给小的脸，不是裁一半', async ($, on) => {
+  engine(on, [], { stored: { isOn: true } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '' } }))
+  await warmUp($, clock)
+
+  expect(await paneFace($, 32)).toEqual({ columns: 44, rows: 26 })
+  expect(await paneFace($, 18)).toEqual({ columns: 26, rows: 15 })
+  expect(await paneFace($, 11)).toEqual({ columns: 22, rows: 6 })
+  expect(await paneFace($, 6)).toEqual({ columns: 22, rows: 6 })
+  // 矮到一档脸都放不下：没有 Raster，但面板仍然有字 —— 不是一片空白
+  expect(await paneFace($, 5)).toBeUndefined()
+  expect((await paneText($)).includes('心情：')).toBe(true)
 })
 
 // ------------------------------------------------------------------ 纯函数

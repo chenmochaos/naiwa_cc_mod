@@ -6,7 +6,13 @@
  * 两种都会报。
  */
 
-export type Mood = 'calm' | 'angry' | 'laugh'
+/**
+ * 面板上画哪个表情。
+ *
+ * 四个值对应 naiwa-images/ 里的四张脸（laugh 取自视频帧）。`sad` 是 v0.3.0 加的：
+ * 你说丧气话、或者命令/测试挂了，它跟着失落 —— 生气的对象是危险命令，不是你。
+ */
+export type Mood = 'calm' | 'angry' | 'laugh' | 'sad'
 
 export type Tally = {
   edits: number

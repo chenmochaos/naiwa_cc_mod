@@ -23,6 +23,7 @@ export const MOOD_NAME: Record<Mood, string> = {
   calm: '平静',
   angry: '生气',
   laugh: '大笑',
+  sad: '失落',
 }
 
 /** 台词槽位。`hitOf` 抠不到词时填这个，别让「「」是吧」这种空壳露出去。 */

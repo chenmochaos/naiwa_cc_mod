@@ -5,13 +5,17 @@
  * LLM 请求），这个文件只负责「把事件接上、把 `$` 调出去、把状态写回去」。
  * 之所以这么切，是因为 `$` 只能传进本文件内声明的函数，不能跨 import。
  *
- * 四条硬约束，别绕过去：
+ * 五条硬约束，别绕过去：
  *  1. `$.audio.play` 在 Linux 上不播 —— 见 audio.ts。
- *  2. 被动开面板要 ≥144 列（被主动开过一次后 110 列），本机终端 80 列，
- *     所以自动触发永远落不下面板，只能降级成音频 + 台词 + toast。
- *  3. `$.ui.blit` 在 Raster 未挂载时返回 `{ deny }`（面板被关掉了），
+ *  2. **被动开面板要 ≥144 列（被主动开过一次后 110 列）**，本机终端 80 列，
+ *     所以 `session.start` 里那次开面板在窄终端上落不下去。救命的是「asked」
+ *     语义：你亲手敲的命令、你发的消息都算你要的，任何宽度都能落 ——
+ *     见 `ensurePane` 为什么挂在 `prompt.submit` 上。
+ *  3. **脸比面板高是这个插件最容易复发的 bug。** 面板行数是引擎给的（80×24 只有
+ *     6 行），别写死尺寸 —— 一律走 `chooseLayout(bodyRows)` 挑档。
+ *  4. `$.ui.blit` 在 Raster 未挂载时返回 `{ deny }`（面板被关掉了），
  *     不是错误，直接 cancel 定时器收摊。
- *  4. **被拦下的命令必须每次都能说话，所以 urgent 场合一次都不读时钟。**
+ *  5. **被拦下的命令必须每次都能说话，所以 urgent 场合一次都不读时钟。**
  *     register.test.ts 的 T1/T2/T4/T5 没搭 `mock.clock`，读一下就是
  *     "no implementation"。见 signals.ts 的 shouldSpeak。
  */
@@ -40,7 +44,9 @@ import {
   playerArgv,
 } from './audio'
 import type { Platform } from './audio'
-import { ART, ART_COLUMNS, ART_ROWS } from './art'
+import { FACES, FACE_PALETTE, FACE_TRANSPARENT } from './face-meta'
+import type { FaceTierName } from './face-meta'
+import { chooseLayout } from './faces'
 import { LAUGH, LAUGH_PALETTE, LAUGH_TRANSPARENT } from './laugh-meta'
 import { DIALECT, MOOD_NAME, fill, reasonOf } from './lines'
 import { MOOD_OF, PRIORITY_OF, describeDanger, occasionOf, shouldSpeak } from './signals'
@@ -183,12 +189,25 @@ function pack(at: (y: number, x: number) => number, columns: number, rows: numbe
   return new Uint8Array(words.buffer).toBase64()
 }
 
-function artCells(m: Mood): { cells: string; columns: number; rows: number } {
-  const grid = ART[m] ?? ART.calm
+/**
+ * faces.bin 的一档 → cells。每像素 1 字节色板下标，255 = 透明。
+ * 写法照抄下面的 `frameCells` —— 区别只是多一层档位偏移。
+ */
+function faceCells(
+  data: Uint8Array,
+  m: Mood,
+  tier: FaceTierName,
+): { cells: string; columns: number; rows: number } | null {
+  const slot = FACES[m]?.[tier]
+  if (slot === undefined) return null
+  const { columns, rows, offset } = slot
   return {
-    cells: pack((y, x) => grid[y][x], ART_COLUMNS, ART_ROWS),
-    columns: ART_COLUMNS,
-    rows: ART_ROWS,
+    cells: pack((y, x) => {
+      const i = data[offset + y * columns + x]
+      return i === FACE_TRANSPARENT ? DEFAULT : (FACE_PALETTE[i] ?? DEFAULT)
+    }, columns, rows),
+    columns,
+    rows,
   }
 }
 
@@ -224,6 +243,20 @@ async function loadFrames($: EngineInterface): Promise<Uint8Array | null> {
     const { base64 } = await $.fs.read(`${$.plugin.root}/data/laugh.bin`, { as: 'bytes' })
     frames = Uint8Array.fromBase64(base64)
     return frames
+  } catch {
+    return null
+  }
+}
+
+/** 13KB，读一次就够 —— 面板每次重绘都读盘太浪费。 */
+let faces: Uint8Array | null = null
+
+async function loadFaces($: EngineInterface): Promise<Uint8Array | null> {
+  if (faces !== null) return faces
+  try {
+    const { base64 } = await $.fs.read(`${$.plugin.root}/data/faces.bin`, { as: 'bytes' })
+    faces = Uint8Array.fromBase64(base64)
+    return faces
   } catch {
     return null
   }
@@ -475,6 +508,39 @@ async function celebrate(
   }
 }
 
+// ---------------------------------------------------------------- 面板在场
+
+/**
+ * 开关开着、面板却不在台上时，把它叫上来。已经在台上了就什么都不做。
+ *
+ * **为什么不能只在 `session.start` 里 `$.ui.open` 一次就算完**：引擎只让「asked」
+ * 的开面板落座，没人要求的那种要 ≥144 列（这个 id 以前被开过才降到 110）。
+ * 而本机 80 列的终端 —— 也就是大多数终端 —— 根本够不着。所以开关是开的、
+ * 面板却不在，看着就是「打开 /naiwa 没有奶蛙」。
+ *
+ * 解法是**换时机**：`session.start` 那次照发（宽终端当场就落，窄终端石沉大海，
+ * 不报错）；真正的抓手挂在 `prompt.submit` —— 你发消息 = 你要的，任何宽度都落。
+ * 于是窄终端里你一打字，奶蛙就上来了，而不是永远差 64 列。
+ *
+ * 顺带一提：重复 `open` 同一个 id 是幂等的（引擎不会开出第二个），
+ * 所以这里的 `panes()` 查询只是省一次无谓的调用，不是为了正确性。
+ */
+async function ensurePane($: EngineInterface): Promise<boolean> {
+  if (!(await read($, isActive))) return false
+  try {
+    const panes = await $.ui.panes()
+    if (panes.some(pane => pane.id === PANE && pane.isPlaced)) return true
+  } catch {
+    // 问不到就当它不在，下面重开一次没有副作用
+  }
+  try {
+    const opened = await $.ui.open({ id: PANE, title: TITLE, columns: PANE_COLUMNS })
+    return opened.isPlaced
+  } catch {
+    return false
+  }
+}
+
 // -------------------------------------------------------------------- 注册
 
 export const register: Register = (on, options) => {
@@ -507,6 +573,8 @@ export const register: Register = (on, options) => {
     await offWork($, e, options)
     // 下班彩蛋已经说过话了就不再寒暄
     if ((await read($, line)) === '') await speak($, { occasion: 'greeting' })
+    // 宽终端当场落地；窄终端引擎不让它落（见 ensurePane），靠下面 prompt.submit 那次补上
+    await ensurePane($)
     return next(e)
   })
 
@@ -532,7 +600,9 @@ export const register: Register = (on, options) => {
     // 而且 `next` 的参数必须是合法的 `CommandRunInput`（`args` 是必填的），
     // 拿引擎给的 `e` 原样往回传在测试环境里会直接被拒。直接给结果最省事。
     if (!opened.isPlaced) {
-      return { text: `🐸 奶蛙来了（面板放不下：${opened.reason}）—— 加宽终端到 110 列再试。` }
+      // 亲手敲的命令是 asked 时机，任何宽度都该落地 —— 走到这儿说明这个会话
+      // 压根没有能放面板的表面（比如 `claude -p`）。那就只剩台词条了。
+      return { text: `🐸 奶蛙来了（这个会话放不下面板：${opened.reason}）—— 台词条照样陪着。` }
     }
     return { text: '🐸 奶蛙上岗了。齁齁齁，要它下班再敲一次 /naiwa。' }
   })
@@ -573,6 +643,9 @@ export const register: Register = (on, options) => {
     if (verdict !== null) {
       await speak($, { occasion: verdict.occasion, hit: verdict.hit, why: verdict.why, said })
     }
+    // 「你发了消息」也是 asked 时机 —— 窄终端里面板唯一落得下来的那一刻。
+    // 放在 speak 之后：先让台词就位，面板上来时第一眼看到的就是它要说的话。
+    await ensurePane($)
     return next(e)
   })
 
@@ -660,29 +733,51 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
     const { Box, Text, Raster } = elements
-    const [m, text, why, t] = [
+    const [m, text, why, t, laughing] = [
       await read($, mood),
       await read($, line),
       await read($, reason),
       await read($, tally),
+      await read($, isLaughing),
     ]
-    const face = e.surface === 'terminal' && Raster !== undefined ? artCells(m) : null
+
+    // 面板能拿几行是引擎说了算（80×24 只给 6 行），而脸有 26 行 —— 不挑档就只剩
+    // 头顶一条，看着就是「打开了却没有奶蛙」。挑档规则见 faces.ts。
+    const bodyRows = Number(e.props?.scroll?.bodyRows ?? 0)
+    const plan = chooseLayout(bodyRows)
+    // 播动画时不降档：laugh.bin 固定 44×26，blit 的 cells 跟 Raster 声明的尺寸
+    // 对不上会画花。矮终端里动画被裁是意料之中（原来就这样），静态表情才是主路径。
+    const tier = laughing ? 'full' : plan.tier
+    const grid =
+      e.surface === 'terminal' && Raster !== undefined && tier !== null
+        ? faceCells((await loadFaces($)) ?? new Uint8Array(), m, tier)
+        : null
+
+    // 画不出脸的时候（桌面表面没 Raster、矮到一档都放不下、素材读不出来）
+    // 至少留一行自报家门。它占的是脸的位置，不占文字预算。
+    const head = grid === null ? [<Text key="name" color="#FCDF69">🐸 奶蛙</Text>] : []
+
+    // 行数不够时**先砍统计、再砍判断依据，台词永远留着** —— 顺序就是这个数组的顺序。
+    const body = [
+      <Text key="line" color="#FCDF69">
+        「{text === '' ? '齁齁齁。' : text}」
+      </Text>,
+      <Text key="mood" dimColor>
+        心情：{MOOD_NAME[m]}
+        {why === '' ? '' : ` · ${why}`}
+      </Text>,
+      <Text key="tally" dimColor>
+        编辑 {t.edits} · 命令 {t.commands} · 失败 {t.failures} · 拦截 {t.blocked}
+      </Text>,
+    ].slice(0, plan.lines)
 
     return (
       <Box flexDirection="column" paddingX={1}>
-        {face !== null ? (
-          <Raster key={FACE_KEY} columns={face.columns} rows={face.rows} cells={face.cells} />
-        ) : (
-          <Text color="#FCDF69">🐸 奶蛙</Text>
+        {grid === null ? null : (
+          <Raster key={FACE_KEY} columns={grid.columns} rows={grid.rows} cells={grid.cells} />
         )}
-        <Text color="#FCDF69">「{text === '' ? '齁齁齁。' : text}」</Text>
-        <Text dimColor>
-          心情：{MOOD_NAME[m]}
-          {why === '' ? '' : ` · ${why}`}
-        </Text>
-        <Text dimColor>
-          编辑 {t.edits} · 命令 {t.commands} · 失败 {t.failures} · 拦截 {t.blocked}
-        </Text>
+        {head}
+        {body}
       </Box>
     )
   })
