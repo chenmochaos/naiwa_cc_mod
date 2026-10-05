@@ -419,7 +419,12 @@ async function speak($: EngineInterface, input: SpeakInput): Promise<void> {
   if (priority === 'notable' || priority === 'normal') {
     // 只有这两档碰时钟。urgent 的测试环境里压根没有 clock。
     const now = await $.clock.now()
-    if (!shouldSpeak(priority, previous.at, now)) return
+    // 冷却压的是「同一件事别重复说」，**不是「状态不许变」**。心情翻篇（平静→失落、
+    // 大笑→失落）必须落下来 —— 被上一句话的冷却吃掉的话，脸和台词条会停在旧心情上，
+    // 「失落」就永远等不到（2026-10-05 那个「改了表情从没触发过」的疑问有一半出在这）。
+    // 心情没变 = 纯粹重复，这才交给冷却压。
+    const turned = (await read($, mood)) !== MOOD_OF[input.occasion]
+    if (!turned && !shouldSpeak(priority, previous.at, now)) return
     at = now
   }
   if (priority === 'urgent') stopTicker()
@@ -720,10 +725,15 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const text = await read($, line)
     if (text === '') return next(e)
+    // 心情写进台词条，是因为**面板不一定有地方写字**：80×24 上面板只给 6 行，
+    // 正好等于 mini 档的脸，`chooseLayout` 只能给 `lines: 0`。那条路径下面板是
+    // 一张脸加零行字，心情永远看不见 —— 台词条不受 `bodyRows` 限制，是窄终端
+    // 唯一的出口。这里必须一直显示（包括「平静」），有对照才认得出「失落」。
+    const m = await read($, mood)
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box>
-        <Text color="#FCDF69">🐸 奶蛙：</Text>
+        <Text color="#FCDF69">🐸 奶蛙 · {MOOD_NAME[m]}：</Text>
         <Text>{text}</Text>
       </Box>
     )
@@ -757,14 +767,16 @@ export const register: Register = (on, options) => {
     // 至少留一行自报家门。它占的是脸的位置，不占文字预算。
     const head = grid === null ? [<Text key="name" color="#FCDF69">🐸 奶蛙</Text>] : []
 
-    // 行数不够时**先砍统计、再砍判断依据，台词永远留着** —— 顺序就是这个数组的顺序。
+    // 行数不够时**先砍统计，再砍台词** —— 顺序就是这个数组的顺序。
+    // 台词排第二不是排在最后：台词条上已经有同一句话了，而「心情 + 判断依据」
+    // 是面板独有的信息。80×28 这种只挤得出一行字的终端，该看到的是心情。
     const body = [
-      <Text key="line" color="#FCDF69">
-        「{text === '' ? '齁齁齁。' : text}」
-      </Text>,
       <Text key="mood" dimColor>
         心情：{MOOD_NAME[m]}
         {why === '' ? '' : ` · ${why}`}
+      </Text>,
+      <Text key="line" color="#FCDF69">
+        「{text === '' ? '齁齁齁。' : text}」
       </Text>,
       <Text key="tally" dimColor>
         编辑 {t.edits} · 命令 {t.commands} · 失败 {t.failures} · 拦截 {t.blocked}

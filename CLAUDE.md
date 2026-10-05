@@ -12,7 +12,7 @@ Claude Code ≥ 2.1.287 的原生插件（不是第三方框架）。它在终�
 | 目录 | 放什么 | 规则 |
 | --- | --- | --- |
 | `plugin/` | **插件本体，唯一的交付物** | 这里的内容必须自洽：能被 `claude plugin validate` 通过、能软链进 dev-mods 直接跑。不放任何开发期脚本 |
-| `plugin/hooks/` | `register.tsx` 编排 + `signals.ts`（场合判定/安全正则/冷却）、`faces.ts`（面板分档）、`gen.ts`（LLM 请求与净化）、`lines.ts`（模板与理由）、`audio.ts`、`*-meta.ts`（生成物） | 逻辑集中在一个 `register.tsx`，其余是纯数据或纯函数，不反向依赖 register；**碰 `$` 的代码只能写在 register.tsx** |
+| `plugin/hooks/` | `register.tsx` 编排 + `signals.ts`（场合判定/危险命令判定/密钥正则/冷却）、`faces.ts`（面板分档）、`gen.ts`（LLM 请求与净化）、`lines.ts`（模板与理由）、`audio.ts`、`*-meta.ts`（生成物） | 逻辑集中在一个 `register.tsx`，其余是纯数据或纯函数，不反向依赖 register；**碰 `$` 的代码只能写在 register.tsx** |
 | `plugin/data/` `plugin/assets/` | 二进制素材（帧数据、音频） | **只能由 `tools/` 生成，禁止手改** |
 | `tools/` | 从原始素材生成 `plugin/` 内容的 Python 流水线 | 每个脚本独立可跑、输出确定；跑完打 SHA-256 打印出来 |
 | `naiwa.md` `naiwa-images/` `naiwa-videos/` | Minus 提供的原始素材 | **只读，永不修改** |
@@ -50,10 +50,46 @@ python3 tools/build_laugh.py               # naiwa-videos/glimpse.mp4 -> plugin/
   （`/naiwa-laugh` 属于 asked，80 列也能落）。
 - **`$.ui.blit` 的定时器必须在所有退出路径上 `cancel()`**，否则面板关了动画还在跑。
 - **热重载会重置模块变量。** 跨会话/跨重载要留的值走 `$.store`；会话内的走 `atom`/`read`/`update`。
+- **但别指望改完源码当前会话就变。** 实测（2026-10-05）：改 `signals.ts` 后，当前会话里跑
+  `grep -c "rm -rf" <file>` 仍被老正则拦下；`touch register.tsx`、以及真的改 `register.tsx` 内容，
+  都不触发重载。同一条命令在**新起的** `claude -p` 会话里立刻放行 —— 说明是加载时机，不是代码错。
+  **验证 hook 行为的改动用新会话**（`cd /tmp && claude -p ...`），别在改代码的这个会话里下结论。
+- **拦截按「命令位」匹配，不扫整条字符串。** `signals.ts` 的 `findDanger` 先把引号内容摘出去，
+  再按 `;` `&&` `|` `(` 断句，剥掉 `sudo`/`env FOO=1`/`timeout 5` 外壳后看第一个词；
+  `bash -c "..."` / `sh -c '...'` / `find -exec` 会递归进去（那里的引号里确实是命令）。
+  **heredoc 正文同理**：`blankHeredocs` 把 `<<'MSG'` 到收尾行的正文抹成空白（保留换行），
+  只有正文归 `bash`/`sh` 这类壳时才单独送进 `findDanger` —— 判断「归谁」用 `heredocOwner`
+  （取 `<<` 前那段的第一个实词，不能用 `commandWord`：`sh - <<EOF` 的 `-` 会让它返回 null）。
+  踩过：本插件自己的 `git commit -F - <<'MSG'` 被自己拦了，只因正文里有一行以 `rm -rf` 开头。
+  收尾行找不到时**什么都不抹** —— 宁可多扫，也不要让一个没配对的 `<<` 把后半条命令藏起来。
+  v0.3.0 之前是一条大正则扫全文，把 `grep -rn "rm -rf" .`、`git commit -m "fix rm -rf"` 全拦了 ——
+  **误报比漏报更伤，人被打断两次就把插件关了**。改这张表之前先看 `register.test.ts` 里那三条
+  「引号里的危险字样只是文字」/「heredoc 正文是数据不是命令」/「真危险命令一个都不能漏」，
+  它们是这份分寸的护栏。
+- **`rm` 要「递归 + 整片目标」两条都占才拦。** 递归看 `-r`/`-R`/`-rf`/`--recursive`
+  （`RM_RECURSIVE`）；整片看 `RM_WHOLE_TREE`（`/` `/*` `~` `$HOME` `.` `..` `*` `./*`）和
+  `RM_SYSTEM`（`/etc` `/usr` `/home/<某人>` 这一级）。**一个目标都没有也拦** ——
+  `xargs rm -rf`、`find -exec rm -rf {} +` 看不见目标，看不见就不放行。
+  `rm -rf build/`、`rm -rf node_modules`、`rm -rf /tmp/x` 一律放行：那是每天的活，
+  拦它不是保护是绊脚石。别再用「按字母出现的位置」匹配开关 ——
+  `/^-{1,2}[A-Za-z]*(r|R|f)/` 会把 `--verbose`、`--force`、`--interactive` 一起吃掉
+  （它们里面都有 r 或 f），实测把插件自己的 `rm -f /tmp/x` 拦下来了。
+- **冷却只压「重复」，不压「状态变化」。** `speak()` 里先看心情有没有翻篇
+  （`MOOD_OF[occasion] !== 当前 mood`）：翻了就无视冷却照写，没翻才交给 `shouldSpeak`。
+  原因：冷却是防刷屏的，**不是用来藏状态的** —— 被上一句话的冷却吃掉的话，脸和台词条会停在
+  旧心情上，用户永远等不到「失落」（2026-10-05 那次「改了伤心表情从没触发过」的另一半根因，
+  探针实测 `in:frustrated` 进了两次、`write` 零次）。改 `speak()` 前先读 `register.test.ts`
+  里「心情变了就不能被冷却吃掉」那条。例外：`isLaughing` 那 10 秒仍然不插嘴，那是彩蛋本身。
 - **`--plugin-dir` 和 dev-mods 都是 session-only 的，活不过重启。** 官方原文 "Load a plugin from a
   directory ... **for this session only**"。`~/.claude/dev-mods/<session-id>/` 是它按 session 落地
   的目录，往里软链只对那一个 session 有效，**不是安装**。持久加载走 `CLAUDE_CODE_PLUGIN_DIRS`
   环境变量（已写进 `~/.claude/settings.json` 的 `env`）。
+- **面板只给 6 行时（80×24）一行字都画不出来，心情必须同时走台词条。** `chooseLayout(6)` 返回
+  `{tier:'mini', lines:0}` —— 6 行正好被 mini 档的脸占满。而 22×6 的迷你脸四种心情长得几乎一样
+  （把 `faces.bin` 渲染成 ASCII 一眼就能看出来，见「验证」一节），所以靠面板=永远看不出「失落」。
+  台词条（`AbovePrompt`）不受 `bodyRows` 限制，是窄终端里唯一看得见心情的地方，格式
+  `🐸 奶蛙 · 失落：…`。2026-10-05 那个「失落从没触发过」的疑问就是这么来的：探针证明
+  `fail → sad` 一直是通的，看不见的是显示那一层。**别把心情只放在面板里。**
 
 ## 测试环境（和真机不一样，写测试前先读这段）
 
@@ -96,7 +132,7 @@ python3 tools/build_laugh.py               # naiwa-videos/glimpse.mp4 -> plugin/
 
 ```bash
 claude plugin validate plugin/          # 清单 + 模块 + $.state 契约
-claude plugin test plugin/              # register.test.ts，34 条，必须全绿
+claude plugin test plugin/              # register.test.ts，41 条，必须全绿
 
 # 证明插件在真实引擎里加载并注册了 hooks（必须在项目目录外跑，排除 CWD 干扰）
 cd /tmp && claude -p --debug-file /tmp/naiwa-load.log "ok" >/dev/null 2>&1
@@ -115,6 +151,11 @@ grep -oE "ui\.open naiwa naiwa \([a-z]+, [0-9]+ columns\): [a-z ]+" /tmp/pane-*.
 # 80 列上期望同时出现： (unasked, 80 columns): waits unplaced   ← session.start 那次，正常
 #                        (asked, 80 columns): placed            ← prompt.submit 那次，这就是修复点
 ```
+
+**表情辨识度自查**（改素材 / 判「用户认不认得出来」时用）：脚本 `/tmp/render_faces.py <tier>`，
+把 `plugin/data/faces.bin` 的四张脸按亮度渲染成 ASCII 并排打印。别靠脑补判断某个档位传不传得出
+情绪 —— mini 档四种心情并排看几乎是同一个黄团，这就是「改了表情但用户没感觉」的物证。
+（脚本是开发期工具，不进仓库；重建也就二十行。）
 
 加载方式（`~/.claude/settings.json` 的 `CLAUDE_CODE_PLUGIN_DIRS`）见 README 的「装」一节。
 真机手测清单在 `docs/superpowers/specs/` 的设计文档末尾。

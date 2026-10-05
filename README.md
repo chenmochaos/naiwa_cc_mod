@@ -1,6 +1,12 @@
 # 奶蛙陪你写代码 🐸
 
-一只ClAUDE CODE桌宠，变异奶龙住进你的终端，陪你上班。根据终端内容变换心情与样式，在你敲 `rm -rf` 的时候一巴掌摁住你的手，在18：00后又一次打开cc时爆笑10s。
+一只CLAUDE CODE桌宠，变异奶龙住进你的终端，陪你上班。根据终端内容变换心情与样式，在你敲 `rm -rf` 的时候生气的一巴掌摁住你的手。
+![Angry](image.png)
+
+当测试报错爆红时失落。
+![Sad](image-1.png)
+
+在18：00后又一次加班打开cc时爆笑10s。
 
 ![下班大笑彩蛋](docs/demo.gif)
 
@@ -51,6 +57,10 @@ claude --plugin-dir /绝对路径/到/naiwa_cc_mod/plugin
 脸按终端给面板多少行分三档：44×26 全身 / 26×15 半身 / 22×6 小脸。140×40 画全身，
 80×24 只剩 6 行就换小脸，矮到连小脸都放不下就退成纯文字 —— **面板始终在**。
 
+**心情同时写在台词条上**：`🐸 奶蛙 · 失落：…`。因为 80×24 的面板 6 行正好被小脸占满，
+一行字都排不下（`chooseLayout` 给 `lines: 0`），只靠面板的话小脸又认不出表情 ——
+台词条不受面板行数限制，窄终端上「失落」全靠它看得见。
+
 不敲命令它也会动：
 
 - **台词跟着你说的话走**。你提 `bug` 它就引用 `bug`，你说"上线了"它跟着庆祝。关键时刻
@@ -61,6 +71,14 @@ claude --plugin-dir /绝对路径/到/naiwa_cc_mod/plugin
 - **危险命令拦截**：`rm -rf`、`git push --force/-f`、`git reset --hard`、`git clean -fd`、
   `git branch -D`、`mkfs`、`dd of=/dev/*`、`> /dev/sd*`、fork 炸弹、`chmod -R 777 /` ——
   命中就 deny，命令**根本不交给引擎**，脸和台词一起变生气。
+  **只在命令真正要跑的地方匹配**：`grep "rm -rf" .`、提交信息里提到 `rm -rf` 都不拦 ——
+  引号里的是文字，不是命令。剥掉 `sudo`、`env FOO=1`、`timeout 5` 这些外壳之后看命令位；
+  `bash -c "..."` 这类**引号里会再跑一遍**的入口会递归进去看。
+  `<<EOF` heredoc 的正文同理：`git commit -F - <<'MSG'` 里写一句 `rm -rf /` 是文字，
+  但正文喂给 `bash` / `sh` 时它**就是代码**，照扫。
+  `rm -rf` 还要求**目标是整片**才拦：`/`、`~`、`/etc` `/usr` 这类系统目录、`.` `..`、`*`，
+  或者压根看不见目标（`xargs rm -rf`）。`rm -rf build/`、`rm -rf node_modules`、`rm -rf /tmp/x`
+  是每天的活，放行 —— 拦它不是保护，是绊脚石。
 - **密钥保护**：`Edit` / `Write` 碰 `.env`、`.ssh/`、`id_rsa`、`*.pem`、`.netrc`、`credentials.json` 一律 deny。
 - **自动彩蛋**：整套测试全绿，或连挂几次之后翻盘 → 放一次大笑动画。
   每场最多 2 次、间隔至少 3 分钟 —— 放太勤就不叫彩蛋了。
@@ -68,6 +86,10 @@ claude --plugin-dir /绝对路径/到/naiwa_cc_mod/plugin
 
 它**不会一直说话**：编辑成功、普通命令成功这些只计数不开口，开口还分三档冷却
 （拦截立刻说、失败类 1.5 秒、寒暄类 8 秒）。
+
+但**冷却只压「同一件事别重复说」，不压「状态变化」**：心情翻篇了一定会说 ——
+刚打完招呼第一条命令就挂、刚笑完测试就红了，脸和台词条立刻跟着变，不会被上一句话的冷却吃掉。
+（唯一例外：大笑动画那 10 秒里不插嘴，那是彩蛋本身。）
 
 ---
 
@@ -117,7 +139,7 @@ python3 tools/build_laugh.py           # naiwa-videos/glimpse.mp4 -> laugh.bin +
 
 ```bash
 claude plugin validate plugin/   # 清单 + 模块 + $.state 契约
-claude plugin test plugin/       # 34 个测试
+claude plugin test plugin/       # 41 个测试
 ```
 
 测试覆盖：危险命令与密钥拦截（并确认命令**没被放行**给引擎）、口吻开关、Linux 音效走 `paplay`

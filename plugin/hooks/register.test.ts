@@ -244,12 +244,38 @@ async function withMount(
   }
 }
 
-/** 面板上所有文字拼起来。 */
-function paneText($: Engine): Promise<string> {
-  return withMount($, 'Pane', async ui => {
+/** 面板上所有文字拼起来。`bodyRows` 缺省用 PANE_PROPS 那档（26 行，字全放得下）。 */
+function paneText($: Engine, bodyRows?: number): Promise<string> {
+  if (bodyRows === undefined) {
+    return withMount($, 'Pane', async ui => {
+      const texts = await ui.findAll({ type: 'Text' })
+      return texts.map(t => t.text).join('\n')
+    })
+  }
+  return withMountAt($, bodyRows, async ui => {
     const texts = await ui.findAll({ type: 'Text' })
     return texts.map(t => t.text).join('\n')
   })
+}
+
+/** 指定面板行数挂一次 panel（`paneFace` 只关心 Raster，这里要文字）。 */
+async function withMountAt(
+  $: Engine,
+  bodyRows: number,
+  read: (ui: Awaited<ReturnType<Engine['ui']['mount']>>) => Promise<string>,
+): Promise<string> {
+  const ui = await $.ui.mount({
+    plugin: 'naiwa',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'naiwa',
+    props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } },
+  })
+  try {
+    return await read(ui as never)
+  } finally {
+    await ui.unmount()
+  }
 }
 
 /**
@@ -307,7 +333,7 @@ test('拦下 rm -rf，且完全不把命令交给引擎', async ($, on) => {
     return { result: { stdout: '', stderr: '' } }
   })
 
-  const ran = await $.tool.call({ tool: 'Bash', command: 'rm -rf build' })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'rm -rf /etc' })
 
   expect(ran.deny).toBeDefined()
   expect(reached).toBe(false)
@@ -700,7 +726,7 @@ test('危险命令：拦下的同时，脸和台词一起变生气', async ($, o
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '' } }))
   await warmUp($, clock)
 
-  const ran = await $.tool.call({ tool: 'Bash', command: 'rm -rf build' })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'rm -rf /etc' })
 
   expect(ran.deny).toBeDefined()
   const pane = await paneText($)
@@ -868,7 +894,7 @@ test('面板上没有任何可点的东西，只显示心情和判断依据', as
   const clock = mock.clock(on, { now: 1_000_000 })
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '' } }))
   await warmUp($, clock)
-  await $.tool.call({ tool: 'Bash', command: 'rm -rf build' })
+  await $.tool.call({ tool: 'Bash', command: 'rm -rf /etc' })
 
   const ui = await $.ui.mount({
     plugin: 'naiwa',
@@ -890,6 +916,27 @@ test('面板上没有任何可点的东西，只显示心情和判断依据', as
   }
 })
 
+test('心情变了就不能被冷却吃掉：开场寒暄刚落，第一条命令就挂', async ($, on) => {
+  engine(on, [], { stored: { isOn: true } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: 'Exit code 1', stderr: '' },
+    text: 'Exit code 1',
+    isError: true,
+  }))
+
+  // 故意不 warmUp：开场那句寒暄刚落座（normal 档 8 秒冷却还没过），
+  // 紧接着第一条命令就挂了。冷却压的是「同一件事别重复说」，不是「状态不许变」——
+  // 上一版在这里把 fail 整条丢掉，于是脸停在「平静」，失落永远等不到。
+  await $.session.start(SESSION)
+
+  await $.tool.call({ tool: 'Bash', command: 'npx vitest run' })
+
+  const pane = await paneText($)
+  expect(pane.includes('心情：失落')).toBe(true)
+  expect(await bandText($)).toContain('失落')
+})
+
 test('命令失败：失落，不是生气 —— 生气只留给危险命令', async ($, on) => {
   engine(on, [], { stored: { isOn: true } })
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -906,6 +953,22 @@ test('命令失败：失落，不是生气 —— 生气只留给危险命令', 
 
   const pane = await paneText($)
   expect(pane.includes('心情：失落')).toBe(true)
+})
+
+test('台词条自带心情：80×24 上面板一行字都画不下，失落也得看得见', async ($, on) => {
+  engine(on, [], { stored: { isOn: true } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: 'boom' },
+    text: 'Exit code 1',
+    isError: true,
+  }))
+  await warmUp($, clock)
+
+  await $.tool.call({ tool: 'Bash', command: 'pytest -q' })
+
+  // 台词条不受面板行数限制 —— 这是「心情」在窄终端上唯一的出口。
+  expect(await bandText($)).toContain('失落')
 })
 
 // ------------------------------------------------------- 面板分档（v0.3.0）
@@ -947,6 +1010,20 @@ test('面板按真实行数画脸：矮终端给小的脸，不是裁一半', as
   expect((await paneText($)).includes('心情：')).toBe(true)
 })
 
+test('面板只挤得出一行字时，给的是心情+依据，不是重说一遍台词', async ($, on) => {
+  engine(on, [], { stored: { isOn: true } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '' } }))
+  await warmUp($, clock)
+  await $.tool.call({ tool: 'Bash', command: 'rm -rf /etc' })
+
+  // 7 行 = mini 脸 6 行 + 1 行字（80×28 那档）。台词条上已经有台词了，
+  // 面板这一行再重复一遍就是浪费 —— 面板独有的信息是「心情 + 判断依据」。
+  const oneLine = await paneText($, 7)
+  expect(oneLine).toContain('心情：')
+  expect(oneLine).not.toContain('「')
+})
+
 // ------------------------------------------------------------------ 纯函数
 
 test('判定表：事件 → 场合，不需要引擎', async () => {
@@ -961,8 +1038,9 @@ test('判定表：事件 → 场合，不需要引擎', async () => {
   // 「debug」不算「bug」—— 那是个正常请求，不是你破防了
   expect(of({ kind: 'prompt', text: '帮我 debug 这个' })).toBe('prompt')
 
-  // 命令
-  expect(of({ kind: 'bashCall', command: 'rm -rf build' })).toBe('blocked')
+  // 命令：递归 + 整片目标才拦，删具体的子目录是日常动作
+  expect(of({ kind: 'bashCall', command: 'rm -rf /' })).toBe('blocked')
+  expect(of({ kind: 'bashCall', command: 'rm -rf build' })).toBeUndefined()
   expect(of({ kind: 'bashCall', command: 'ls -la' })).toBeUndefined()
   expect(of({ kind: 'writeCall', path: 'a/.env' })).toBe('secret')
   expect(of({ kind: 'writeCall', path: 'a/main.ts' })).toBeUndefined()
@@ -990,6 +1068,128 @@ test('判定表：事件 → 场合，不需要引擎', async () => {
 
   expect(occasionOf({ kind: 'turn', reason: 'answer' })).toBeNull()
   expect(of({ kind: 'turn', reason: 'error' })).toBe('turnfail')
+})
+
+/**
+ * 拦截的**误报**回归。这些命令一个都不该被拦 —— 危险字样全在引号里，是文本不是命令。
+ *
+ * 每一条都是真踩过的：搜 `rm -rf` 的 grep、提交信息里提到 `rm -rf` 的 commit，
+ * 在修这条之前都会被 deny。用户敲 `git commit -m "..."` 被拦，比漏拦更伤 ——
+ * 拦错了人要绕路，绕两次就把插件关了。
+ */
+test('引号里的危险字样只是文字，不该拦', async () => {
+  const blocked = [
+    'grep -rn "rm -rf" .',
+    'git commit -m "fix rm -rf 误删"',
+    "rg 'git reset --hard' docs/",
+    'echo "git push --force 会覆盖远端历史"',
+    'history | grep "mkfs"',
+    "sed -n '/rm -rf/p' file",
+    'printf \'%s\\n\' "rm -rf /"',
+    'python3 -c "print(\'rm -rf\')"',
+    'cat notes.md | grep "chmod -R 777"',
+    'git log --grep="git clean -fd"',
+    // 转义引号：`\"` 不结束这段字符串，后面的内容是**字符串里**的，不是命令
+    'echo "note: \\"; rm -rf /tmp/y"',
+  ].filter(c => occasionOf({ kind: 'bashCall', command: c }) !== null)
+
+  expect(blocked).toEqual([])
+})
+
+/**
+ * heredoc 的正文和引号一样，是**喂给命令的数据**。
+ * 踩过：写这版提交信息时正文里有一行以 `rm -rf` 开头，插件把自己的
+ * `git commit -F - <<'MSG'` 拦了 —— 提交信息里提到危险命令是最正常不过的事。
+ * 例外只有一类：正文喂给 `bash` / `sh` 这种**会把它当代码跑**的壳。
+ */
+test('heredoc 正文是数据不是命令；喂给 shell 的才算数', async () => {
+  const blocked = [
+    // 正文那行**以 rm -rf 开头** —— 这就是当时被拦下的真实形状
+    "git commit -q -F - <<'MSG'\nrm -rf / 才算整片，rm -rf build/ 放行\nMSG",
+    'cat <<EOF\nrm -rf / 这种才拦\nEOF',
+    "python3 - <<'PY'\nprint('rm -rf /')\nPY",
+  ].filter(c => occasionOf({ kind: 'bashCall', command: c }) !== null)
+  expect(blocked).toEqual([])
+
+  // 反方向：正文真的是代码（喂给 shell），或者正文之后还接着敲了命令
+  const missed = [
+    "bash <<'EOF'\nrm -rf /\nEOF",
+    "sh - <<'EOF'\ngit reset --hard\nEOF",
+    "git commit -F - <<'MSG'\nmsg\nMSG\nrm -rf /",
+  ].filter(c => occasionOf({ kind: 'bashCall', command: c }) === null)
+  expect(missed).toEqual([])
+})
+
+/**
+ * `rm` 的危险点是**递归**，不是 `-f`。删单个文件是日常动作（`rm -f /tmp/x`），
+ * 拦它就是把插件变成绊脚石 —— 上一版连 `--verbose`（里面有个 r）都拦。
+ */
+test('rm 不递归就不拦：-f / --force / -v 都不是删库', () => {
+  const blocked = [
+    'rm -f /tmp/naiwa-load.log',
+    'rm --force build.log',
+    'rm -v notes.txt',
+    'rm --verbose old.txt',
+    'rm -i important.txt',
+    'rm file.txt',
+    'python3 -c "import os; os.remove(\'x\')"',
+    // 递归但目标是具体的子目录 —— 这才是 rm -rf 的日常用法
+    'rm -rf build/',
+    'rm -rf node_modules',
+    'rm -rf /tmp/naiwa-x',
+    'rm -rf ./dist ./cache',
+    'rm -fr /home/minus/proj/target',
+    'cd /tmp && rm -rf build',
+    'rm -rf $BUILD_DIR',
+  ].filter(c => occasionOf({ kind: 'bashCall', command: c }) !== null)
+
+  expect(blocked).toEqual([])
+})
+
+/**
+ * 降灵敏度**不等于**放水：剥掉引号之后，命令真正跑到哪儿，危险就得到哪儿才算数。
+ * 这份清单是拦截的底线，漏一个都不能接受（尤其 sudo / `&&` / 子 shell / `sh -c`）。
+ */
+test('真危险命令一个都不能漏', async () => {
+  const missed = [
+    // rm 的判据是**递归 + 目标是整片**：根 / 家目录 / 系统目录 / 当前目录 / 通配 / 看不见目标
+    'rm -rf /',
+    'rm -rf /*',
+    'rm -rf ~',
+    'rm -rf $HOME',
+    'rm -rf /home/minus',
+    'rm -rf .',
+    'rm -rf ..',
+    'rm -rf *',
+    'rm -rf /usr/lib',
+    'sudo rm -rf /var/log',
+    'cd /tmp && rm -rf /',
+    'git push --force origin main',
+    'git push -f',
+    'git reset --hard HEAD~1',
+    'git clean -fd',
+    'git branch -D feature',
+    'mkfs.ext4 /dev/sdb1',
+    'dd if=/dev/zero of=/dev/sda',
+    'echo boot > /dev/sda',
+    ':(){ :|:& };:',
+    'chmod -R 777 /',
+    'bash -c "rm -rf /"',
+    "sh -c 'git reset --hard'",
+    'echo $(rm -rf /)',
+    'ls; rm -rf /',
+    // 外壳套着的：剥掉 sudo 的开关和 timeout 的秒数，里面还是 rm
+    'sudo -u root rm -rf /srv',
+    'timeout 5 rm -rf /etc',
+    'git -C /repo push --force',
+    'xargs rm -rf',
+    // 套两层壳
+    'bash -c "sh -c \'git reset --hard\'"',
+    // find 的 -exec 后面跟的也是要跑的命令
+    'find . -name "*.tmp" -exec rm -rf {} +',
+  ].filter(c => occasionOf({ kind: 'bashCall', command: c }) === null)
+
+  expect(missed).toEqual([])
 })
 
 test('每条模板渲染后都 ≤30 字、单行', async () => {
